@@ -1,5 +1,4 @@
 #![cfg_attr(not(feature = "cuda"), forbid(unsafe_code))]
-#![cfg_attr(feature = "cuda", deny(unsafe_code))]
 //! Transformer forward pass for vllm-rs.
 //!
 //! Provides `ModelRunner` which orchestrates the forward pass through

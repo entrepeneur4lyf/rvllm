@@ -73,9 +73,9 @@ fn cuda_list_devices() -> Vec<GpuDevice> {
             })
             .unwrap_or((0, 0));
 
-        let total_memory = dev
-            .total_mem()
-            .unwrap_or(0);
+        let total_memory = unsafe {
+            cudarc::driver::result::device::total_mem(*dev.cu_device())
+        }.unwrap_or(0);
 
         devices.push(GpuDevice {
             id,

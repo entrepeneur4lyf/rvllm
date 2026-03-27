@@ -8,7 +8,7 @@
 //! parent `mod.rs`. It delegates the unsafe cuBLAS call to `rvllm_gpu::cublas_ops`
 //! so this crate's `#![forbid(unsafe_code)]` is respected.
 
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _};
 use std::sync::Arc;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;

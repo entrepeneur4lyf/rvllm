@@ -13,7 +13,7 @@ categories = ["caching", "science"]
 
 [features]
 default = []
-cuda = ["rvllm-gpu/cuda"]
+cuda = ["rvllm-gpu/cuda", "dep:cudarc"]
 
 [dependencies]
 rvllm-core.workspace = true
@@ -22,3 +22,4 @@ thiserror.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
+cudarc = { version = "0.12", features = ["driver"], optional = true }

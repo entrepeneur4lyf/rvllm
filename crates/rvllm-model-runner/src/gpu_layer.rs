@@ -18,7 +18,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _, LaunchAsync, LaunchConfig};
     use tracing::trace;
 
     use rvllm_core::error::{LLMError, Result};
@@ -288,7 +288,7 @@ mod inner {
                 .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
             unsafe {
                 kernel
-                    .launch(cfg, (&input, &weight, &mut output, eps, hidden_size as u32, num_tokens as u32))
+                    .launch(cfg, (input, weight, &mut output, eps, hidden_size as u32, num_tokens as u32))
                     .map_err(|e| LLMError::GpuError(format!("rms_norm launch failed: {e}")))?;
             }
 
@@ -366,7 +366,7 @@ mod inner {
             // Grid covers all (token, head) pairs; each thread handles one frequency.
             unsafe {
                 kernel_q
-                    .launch(q_cfg, (&mut q_out, &positions, head_dim as u32, num_heads as u32))
+                    .launch(q_cfg, (&mut q_out, positions, head_dim as u32, num_heads as u32))
                     .map_err(|e| LLMError::GpuError(format!("rope q launch failed: {e}")))?;
             }
 
@@ -382,7 +382,7 @@ mod inner {
             // SAFETY: k_out has exactly k_len elements. Same contract as Q launch.
             unsafe {
                 kernel_k
-                    .launch(k_cfg, (&mut k_out, &positions, head_dim as u32, num_kv_heads as u32))
+                    .launch(k_cfg, (&mut k_out, positions, head_dim as u32, num_kv_heads as u32))
                     .map_err(|e| LLMError::GpuError(format!("rope k launch failed: {e}")))?;
             }
 
@@ -452,11 +452,11 @@ mod inner {
                         cfg,
                         (
                             &mut output,
-                            &q,
-                            &key_cache,
-                            &value_cache,
-                            &block_tables,
-                            &context_lens,
+                            q,
+                            key_cache,
+                            value_cache,
+                            block_tables,
+                            context_lens,
                             scale,
                             num_heads as i32,
                             num_kv_heads as i32,
@@ -504,7 +504,7 @@ mod inner {
             // Grid covers all elements with ceil division.
             unsafe {
                 kernel
-                    .launch(cfg, (&mut output, &gate, &up, n as u32))
+                    .launch(cfg, (&mut output, gate, up, n as u32))
                     .map_err(|e| LLMError::GpuError(format!("fused_silu_mul launch failed: {e}")))?;
             }
 
@@ -541,7 +541,7 @@ mod inner {
                 Some(k) => {
                     // SAFETY: a, b, output all have exactly n elements.
                     unsafe {
-                        k.launch(cfg, (&mut output, &a, &b, n as u32))
+                        k.launch(cfg, (&mut output, a, b, n as u32))
                             .map_err(|e| LLMError::GpuError(format!("add_kernel launch failed: {e}")))?;
                     }
                 }

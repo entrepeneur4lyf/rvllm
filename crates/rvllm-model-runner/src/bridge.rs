@@ -28,7 +28,8 @@ pub mod upstream_gpu {
         GpuStream as RealGpuStream,
         MemoryInfo,
     };
-    // MockGpuAllocator is available when rvllm-gpu has mock-gpu feature (its default)
+    // MockGpuAllocator is available when rvllm-gpu has mock-gpu (its default) and cuda is off.
+    #[cfg(not(feature = "cuda"))]
     pub use rvllm_gpu::mock::MockGpuAllocator as RealMockGpuAllocator;
 }
 

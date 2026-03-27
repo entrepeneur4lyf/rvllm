@@ -4,15 +4,16 @@
 //! it each step instead of re-launching individual kernels. This eliminates
 //! kernel launch overhead and yields 2-5x speedup for decode.
 //!
-//! Under `mock-gpu` the graph is a no-op wrapper that records capture/replay
-//! calls for testing. Under `cuda` it uses the CUDA driver graph API via cudarc.
+//! Under `cuda-graphs` feature, uses the CUDA driver graph API via cudarc.
+//! Under plain `cuda` or `mock-gpu`, the graph pool is a no-op: capture/replay
+//! calls succeed but do nothing, so the engine falls back to normal launches.
 
 use std::collections::HashMap;
 
 use tracing::{debug, info, trace, warn};
 
 use crate::Result;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda-graphs")]
 use crate::LLMError;
 
 /// Supported batch sizes for which we pre-capture CUDA graphs.
@@ -25,22 +26,18 @@ pub fn padded_batch_size(actual: usize) -> Option<usize> {
 }
 
 /// A captured CUDA graph that can be replayed.
-///
-/// Under `cuda` this wraps the driver-level graph and executable graph handles.
-/// Under `mock-gpu` it is a lightweight marker for testing.
 pub struct CudaGraph {
     batch_size: usize,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-graphs")]
     graph: cudarc::driver::sys::CUgraph,
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-graphs")]
     exec: cudarc::driver::sys::CUgraphExec,
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(feature = "cuda-graphs"))]
     replay_count: std::sync::atomic::AtomicUsize,
 }
 
 // SAFETY: The CUDA graph/exec handles are device objects managed by the driver.
-// They are thread-safe to send across threads (replay must happen on the same
-// device context but ownership transfer is fine).
+// They are thread-safe to send across threads.
 unsafe impl Send for CudaGraph {}
 unsafe impl Sync for CudaGraph {}
 
@@ -51,10 +48,9 @@ impl CudaGraph {
     }
 
     /// Replay the captured graph on the given stream.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-graphs")]
     pub fn replay(&self, stream: &crate::stream::GpuStream) -> Result<()> {
         trace!(batch_size = self.batch_size, "replaying CUDA graph");
-        // SAFETY: exec and stream are valid handles on the same device.
         let result = unsafe {
             cudarc::driver::sys::cuGraphLaunch(
                 self.exec,
@@ -70,17 +66,17 @@ impl CudaGraph {
         Ok(())
     }
 
-    /// Replay (mock): just increments the counter.
-    #[cfg(not(feature = "cuda"))]
+    /// Replay (no-op): just increments the counter.
+    #[cfg(not(feature = "cuda-graphs"))]
     pub fn replay(&self, _stream: &crate::stream::GpuStream) -> Result<()> {
-        trace!(batch_size = self.batch_size, "replaying CUDA graph (mock)");
+        trace!(batch_size = self.batch_size, "replaying CUDA graph (no-op)");
         self.replay_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    /// Number of times this graph has been replayed (mock-gpu only, for testing).
-    #[cfg(not(feature = "cuda"))]
+    /// Number of times this graph has been replayed (no-op builds only, for testing).
+    #[cfg(not(feature = "cuda-graphs"))]
     pub fn replay_count(&self) -> usize {
         self.replay_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -89,9 +85,8 @@ impl CudaGraph {
 
 impl Drop for CudaGraph {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "cuda-graphs")]
         {
-            // SAFETY: destroying valid graph handles.
             unsafe {
                 cudarc::driver::sys::cuGraphExecDestroy(self.exec);
                 cudarc::driver::sys::cuGraphDestroy(self.graph);
@@ -102,9 +97,6 @@ impl Drop for CudaGraph {
 }
 
 /// Pool of pre-captured CUDA graphs keyed by batch size.
-///
-/// The pool lazily captures graphs on first use for each batch size and caches
-/// them for subsequent decode steps.
 pub struct CudaGraphPool {
     graphs: HashMap<usize, CudaGraph>,
     max_batch_size: usize,
@@ -112,7 +104,6 @@ pub struct CudaGraphPool {
 }
 
 impl CudaGraphPool {
-    /// Create a new empty graph pool.
     pub fn new(max_batch_size: usize) -> Self {
         info!(max_batch_size, "creating CudaGraphPool");
         Self {
@@ -122,27 +113,20 @@ impl CudaGraphPool {
         }
     }
 
-    /// Whether CUDA graph replay is enabled.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Disable graph capture/replay (fall back to normal kernel launches).
     pub fn disable(&mut self) {
         warn!("CUDA graph replay disabled");
         self.enabled = false;
     }
 
-    /// Enable graph capture/replay.
     pub fn enable(&mut self) {
         info!("CUDA graph replay enabled");
         self.enabled = true;
     }
 
-    /// Look up a cached graph for the given actual batch size.
-    ///
-    /// Returns `None` if no suitable graph exists yet (caller should capture one)
-    /// or if the batch size exceeds the maximum.
     pub fn get(&self, actual_batch_size: usize) -> Option<&CudaGraph> {
         if !self.enabled {
             return None;
@@ -154,41 +138,33 @@ impl CudaGraphPool {
         self.graphs.get(&padded)
     }
 
-    /// Check whether a graph is cached for the given batch size.
     pub fn has_graph(&self, actual_batch_size: usize) -> bool {
         padded_batch_size(actual_batch_size)
             .map(|p| self.graphs.contains_key(&p))
             .unwrap_or(false)
     }
 
-    /// Insert a captured graph into the pool.
     pub fn insert(&mut self, graph: CudaGraph) {
         let bs = graph.batch_size();
         debug!(batch_size = bs, "caching CUDA graph");
         self.graphs.insert(bs, graph);
     }
 
-    /// Number of cached graphs.
     pub fn len(&self) -> usize {
         self.graphs.len()
     }
 
-    /// Whether the pool has no cached graphs.
     pub fn is_empty(&self) -> bool {
         self.graphs.is_empty()
     }
 
-    /// Remove all cached graphs (e.g., after model reload).
     pub fn clear(&mut self) {
         info!(count = self.graphs.len(), "clearing CUDA graph pool");
         self.graphs.clear();
     }
 
     /// Begin capturing a CUDA graph on the given stream.
-    ///
-    /// After calling this, all kernel launches on `stream` are recorded into a
-    /// graph rather than executed immediately. Call [`end_capture`] when done.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-graphs")]
     pub fn begin_capture(
         &self,
         stream: &crate::stream::GpuStream,
@@ -210,7 +186,7 @@ impl CudaGraphPool {
     }
 
     /// End capture and produce a [`CudaGraph`] for the given batch size.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda-graphs")]
     pub fn end_capture(
         &mut self,
         stream: &crate::stream::GpuStream,
@@ -243,7 +219,6 @@ impl CudaGraphPool {
             )
         };
         if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            // Clean up the graph on failure.
             unsafe {
                 cudarc::driver::sys::cuGraphDestroy(graph);
             }
@@ -261,24 +236,24 @@ impl CudaGraphPool {
         })
     }
 
-    /// Begin capture (mock): no-op.
-    #[cfg(not(feature = "cuda"))]
+    /// Begin capture (no-op when cuda-graphs feature is off).
+    #[cfg(not(feature = "cuda-graphs"))]
     pub fn begin_capture(
         &self,
         _stream: &crate::stream::GpuStream,
     ) -> Result<()> {
-        debug!("beginning CUDA graph capture (mock)");
+        debug!("beginning CUDA graph capture (no-op)");
         Ok(())
     }
 
-    /// End capture (mock): produces a mock CudaGraph.
-    #[cfg(not(feature = "cuda"))]
+    /// End capture (no-op): produces a stub CudaGraph.
+    #[cfg(not(feature = "cuda-graphs"))]
     pub fn end_capture(
         &mut self,
         _stream: &crate::stream::GpuStream,
         batch_size: usize,
     ) -> Result<CudaGraph> {
-        debug!(batch_size, "ending CUDA graph capture (mock)");
+        debug!(batch_size, "ending CUDA graph capture (no-op)");
         Ok(CudaGraph {
             batch_size,
             replay_count: std::sync::atomic::AtomicUsize::new(0),
@@ -368,7 +343,7 @@ mod tests {
         pool.begin_capture(&stream).unwrap();
         let graph = pool.end_capture(&stream, 8).unwrap();
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "cuda-graphs"))]
         {
             assert_eq!(graph.replay_count(), 0);
             graph.replay(&stream).unwrap();
@@ -377,9 +352,8 @@ mod tests {
             assert_eq!(graph.replay_count(), 3);
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "cuda-graphs")]
         {
-            // On real CUDA we just verify replay doesn't panic with a valid graph.
             let _ = &graph;
         }
     }
@@ -394,7 +368,6 @@ mod tests {
     #[test]
     fn pool_exceeds_max() {
         let pool = CudaGraphPool::new(8);
-        // batch size 16 exceeds max of 8
         assert!(pool.get(16).is_none());
         assert!(!pool.has_graph(16));
     }

@@ -32,7 +32,6 @@ impl GpuStream {
         let device = CudaDevice::new(device_id).map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA device init failed: {e}"))
         })?;
-        let device = Arc::new(device);
         let stream = device.fork_default_stream().map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA stream creation failed: {e}"))
         })?;

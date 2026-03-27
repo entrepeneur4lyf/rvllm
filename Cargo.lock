@@ -2578,6 +2578,7 @@ name = "rvllm-kv-cache"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cudarc",
  "half",
  "rvllm-core",
  "rvllm-gpu",
@@ -2600,6 +2601,8 @@ dependencies = [
 name = "rvllm-model-loader"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
+ "half",
  "memmap2",
  "rvllm-core",
  "rvllm-gpu",
@@ -2615,6 +2618,7 @@ dependencies = [
 name = "rvllm-model-runner"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "half",
  "rvllm-attention",
  "rvllm-core",

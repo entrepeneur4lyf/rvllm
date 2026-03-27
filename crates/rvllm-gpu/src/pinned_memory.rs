@@ -21,7 +21,7 @@ pub struct PinnedBuffer<T: Pod + Send> {
     ptr: *mut T,
     #[cfg(feature = "cuda")]
     len: usize,
-    #[cfg(feature = "mock-gpu")]
+    #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
     data: Vec<T>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -41,7 +41,7 @@ impl<T: Pod + Send> PinnedBuffer<T> {
                 len: 0,
                 _marker: std::marker::PhantomData,
             });
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             return Ok(Self {
                 data: Vec::new(),
                 _marker: std::marker::PhantomData,
@@ -79,7 +79,7 @@ impl<T: Pod + Send> PinnedBuffer<T> {
             })
         }
 
-        #[cfg(feature = "mock-gpu")]
+        #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
         {
             Ok(Self {
                 data: vec![T::zeroed(); count],
@@ -91,7 +91,7 @@ impl<T: Pod + Send> PinnedBuffer<T> {
     pub fn len(&self) -> usize {
         #[cfg(feature = "cuda")]
         { self.len }
-        #[cfg(feature = "mock-gpu")]
+        #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
         { self.data.len() }
     }
 
@@ -112,7 +112,7 @@ impl<T: Pod + Send> PinnedBuffer<T> {
             // SAFETY: ptr was allocated with cuMemAllocHost for self.len elements.
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
-        #[cfg(feature = "mock-gpu")]
+        #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
         { &self.data }
     }
 
@@ -125,21 +125,21 @@ impl<T: Pod + Send> PinnedBuffer<T> {
             // SAFETY: ptr was allocated with cuMemAllocHost for self.len elements.
             unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
         }
-        #[cfg(feature = "mock-gpu")]
+        #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
         { &mut self.data }
     }
 
     pub fn as_ptr(&self) -> *const T {
         #[cfg(feature = "cuda")]
         { self.ptr as *const T }
-        #[cfg(feature = "mock-gpu")]
+        #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
         { self.data.as_ptr() }
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut T {
         #[cfg(feature = "cuda")]
         { self.ptr }
-        #[cfg(feature = "mock-gpu")]
+        #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
         { self.data.as_mut_ptr() }
     }
 

@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use bytemuck::Pod;
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice as _};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ pub struct GpuBuffer<T: Pod + Send> {
 }
 
 pub(crate) enum GpuBufferInner<T: Pod + Send> {
-    #[cfg(feature = "mock-gpu")]
+    #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
     Mock {
         data: Vec<T>,
         on_drop: Option<Box<dyn FnOnce(usize) + Send>>,
@@ -47,7 +47,7 @@ unsafe impl<T: Pod + Send> Sync for GpuBuffer<T> {}
 impl<T: Pod + Send> GpuBuffer<T> {
     pub fn len(&self) -> usize {
         match &self.inner {
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => data.len(),
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, .. } => slice.len(),
@@ -66,7 +66,7 @@ impl<T: Pod + Send> GpuBuffer<T> {
 
     pub fn as_ptr(&self) -> *const T {
         match &self.inner {
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => data.as_ptr(),
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, .. } => {
@@ -80,7 +80,7 @@ impl<T: Pod + Send> GpuBuffer<T> {
 
     pub fn as_mut_ptr(&mut self) -> *mut T {
         match &mut self.inner {
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => data.as_mut_ptr(),
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, .. } => {
@@ -101,14 +101,23 @@ impl<T: Pod + Send> GpuBuffer<T> {
             )));
         }
         match &mut self.inner {
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => {
                 data.copy_from_slice(src);
                 Ok(())
             }
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, device } => {
-                device.htod_sync_copy_into(src, slice).map_err(|e| {
+                device.bind_to_thread().map_err(|e| {
+                    crate::LLMError::MemoryError(format!("CUDA bind failed: {e}"))
+                })?;
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_sync(
+                        *DevicePtrMut::device_ptr_mut(slice),
+                        src,
+                    )
+                }
+                .map_err(|e| {
                     crate::LLMError::MemoryError(format!("CUDA htod copy failed: {e}"))
                 })?;
                 Ok(())
@@ -122,11 +131,22 @@ impl<T: Pod + Send> GpuBuffer<T> {
 
     pub fn copy_to_host(&self) -> Result<Vec<T>> {
         match &self.inner {
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => Ok(data.clone()),
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, device } => {
-                let host = device.dtoh_sync_copy(slice).map_err(|e| {
+                device.bind_to_thread().map_err(|e| {
+                    crate::LLMError::MemoryError(format!("CUDA bind failed: {e}"))
+                })?;
+                let len = cudarc::driver::DeviceSlice::len(slice);
+                let mut host = vec![T::zeroed(); len];
+                unsafe {
+                    cudarc::driver::result::memcpy_dtoh_sync(
+                        &mut host,
+                        *DevicePtr::device_ptr(slice),
+                    )
+                }
+                .map_err(|e| {
                     crate::LLMError::MemoryError(format!("CUDA dtoh copy failed: {e}"))
                 })?;
                 Ok(host)
@@ -142,7 +162,7 @@ impl<T: Pod + Send> GpuBuffer<T> {
 impl<T: Pod + Send> Drop for GpuBuffer<T> {
     fn drop(&mut self) {
         match &mut self.inner {
-            #[cfg(feature = "mock-gpu")]
+            #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, on_drop } => {
                 let bytes = data.len() * std::mem::size_of::<T>();
                 if let Some(cb) = on_drop.take() {

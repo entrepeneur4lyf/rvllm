@@ -5,7 +5,7 @@
 //! cudarc for device memory types.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
@@ -87,13 +87,12 @@ impl CudaRMSNorm {
         // the length checks above. `output` is freshly allocated with the correct
         // size. The launch config matches the kernel's expected grid/block/shared
         // memory layout as documented in rms_norm.cu.
+        let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
         unsafe {
-            loader
-                .launch(
-                    "rms_norm",
-                    "rms_norm_kernel",
-                    cfg,
+            func
+                .launch_on_stream(
                     stream,
+                    cfg,
                     (&output, input, weight, eps, hidden_size_i32),
                 )
                 .map_err(|e| {
@@ -149,15 +148,21 @@ impl CudaRMSNorm {
         // SAFETY: In-place variant -- output pointer == input pointer. The kernel
         // uses __syncthreads() between reading input and writing output within each
         // block, so there is no data race for a single-token-per-block launch.
+        let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
         unsafe {
-            loader
-                .launch(
-                    "rms_norm",
-                    "rms_norm_kernel",
-                    cfg,
-                    stream,
-                    (input, input as &CudaSlice<f32>, weight, eps, hidden_size_i32),
-                )
+            let mut in_ptr = *DevicePtrMut::device_ptr_mut(input);
+            let mut w_ptr = *DevicePtr::device_ptr(weight);
+            let mut eps_val = eps;
+            let mut hs = hidden_size_i32;
+            let params: &mut [*mut std::ffi::c_void] = &mut [
+                &mut in_ptr as *mut _ as *mut _,  // output (aliases input)
+                &mut in_ptr as *mut _ as *mut _,  // input
+                &mut w_ptr as *mut _ as *mut _,
+                &mut eps_val as *mut _ as *mut _,
+                &mut hs as *mut _ as *mut _,
+            ];
+            func
+                .launch_on_stream(stream, cfg, params)
                 .map_err(|e| {
                     LLMError::GpuError(format!(
                         "CudaRMSNorm: inplace kernel launch failed: {e}"

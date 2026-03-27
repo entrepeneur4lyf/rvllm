@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "cuda"), forbid(unsafe_code))]
 //! Model weight loading for vllm-rs.
 //!
 //! Supports safetensors and GGUF formats with memory-mapped I/O,
@@ -7,6 +7,8 @@
 pub mod dtype;
 pub mod gguf;
 pub mod gpu_loader;
+#[cfg(feature = "cuda")]
+pub mod gpu_weights;
 pub mod mapper;
 pub mod safetensors;
 pub mod shard;

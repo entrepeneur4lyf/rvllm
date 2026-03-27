@@ -1137,6 +1137,10 @@ fn worker_config_from_engine(model_path: &str, config: &rvllm_config::EngineConf
         rope_theta: 10000.0,
         kv_cache_dtype: config.cache.kv_cache_dtype.clone(),
         enable_prefix_caching: config.cache.enable_prefix_caching,
+        partial_rotary_factor: 1.0,
+        attn_logit_softcapping: 0.0,
+        num_local_experts: 0,
+        num_experts_per_tok: 0,
     }
 }
 

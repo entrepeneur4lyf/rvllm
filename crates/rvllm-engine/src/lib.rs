@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "cuda"), forbid(unsafe_code))]
 //! Main inference engine for vllm-rs.
 //!
 //! Composes the scheduler, executor, and tokenizer into a synchronous

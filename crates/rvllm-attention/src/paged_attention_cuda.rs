@@ -33,6 +33,11 @@ pub struct CudaPagedAttention {
     stream: CudaStream,
 }
 
+// SAFETY: CudaStream wraps a driver handle bound to a device context.
+// We ensure all GPU work on this stream is synchronized before cross-thread use.
+unsafe impl Send for CudaPagedAttention {}
+unsafe impl Sync for CudaPagedAttention {}
+
 impl CudaPagedAttention {
     /// Create a new CUDA paged attention backend.
     ///
@@ -62,7 +67,7 @@ impl CudaPagedAttention {
     pub fn with_device(device_id: usize, ptx_bytes: &[u8]) -> Result<Self> {
         let device = CudaDevice::new(device_id)
             .map_err(|e| LLMError::GpuError(format!("CUDA device {device_id} init: {e}")))?;
-        Self::new(Arc::new(device), ptx_bytes)
+        Self::new(device, ptx_bytes)
     }
 
     /// Upload a host f16 slice to the GPU as f32.

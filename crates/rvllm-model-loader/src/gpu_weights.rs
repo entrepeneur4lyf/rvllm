@@ -8,7 +8,7 @@ mod inner {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice};
+    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _};
     use tracing::debug;
     use rvllm_core::error::{LLMError, Result};
 

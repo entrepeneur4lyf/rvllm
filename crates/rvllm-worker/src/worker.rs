@@ -109,6 +109,9 @@ impl Worker {
         );
 
         // TODO: use the real GPU allocator once CacheEngine::new accepts dyn GpuAllocator
+        #[cfg(feature = "cuda")]
+        let kv_alloc = rvllm_gpu::cuda_allocator::CudaGpuAllocator::new(self.device_id)?;
+        #[cfg(not(feature = "cuda"))]
         let kv_alloc = rvllm_gpu::prelude::MockGpuAllocator::new(1 << 30);
 
         let engine = CacheEngine::new(

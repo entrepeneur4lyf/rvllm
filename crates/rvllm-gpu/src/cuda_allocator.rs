@@ -20,7 +20,6 @@ impl CudaGpuAllocator {
         let device = CudaDevice::new(device_id).map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA device {device_id} init failed: {e}"))
         })?;
-        let device = Arc::new(device);
         debug!(device_id, "CudaGpuAllocator created");
         Ok(Self { device })
     }
@@ -35,9 +34,18 @@ impl GpuAllocator for CudaGpuAllocator {
         let bytes = count * std::mem::size_of::<T>();
         trace!(bytes, count, "CUDA alloc");
 
-        let slice = self.device.alloc_zeros::<T>(count).map_err(|e| {
-            crate::LLMError::MemoryError(format!("CUDA alloc failed ({bytes} bytes): {e}"))
-        })?;
+        let slice = unsafe {
+            self.device.bind_to_thread().map_err(|e| {
+                crate::LLMError::MemoryError(format!("CUDA bind failed: {e}"))
+            })?;
+            let cu_ptr = cudarc::driver::result::malloc_sync(bytes).map_err(|e| {
+                crate::LLMError::MemoryError(format!("CUDA alloc failed ({bytes} bytes): {e}"))
+            })?;
+            cudarc::driver::result::memset_d8_sync(cu_ptr, 0, bytes).map_err(|e| {
+                crate::LLMError::MemoryError(format!("CUDA memset failed ({bytes} bytes): {e}"))
+            })?;
+            self.device.upgrade_device_ptr::<T>(cu_ptr, count)
+        };
 
         Ok(GpuBuffer {
             inner: GpuBufferInner::Cuda {

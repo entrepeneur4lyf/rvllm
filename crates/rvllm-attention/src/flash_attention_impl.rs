@@ -58,6 +58,12 @@ struct CudaFlashState {
     stream: cudarc::driver::CudaStream,
 }
 
+// SAFETY: CudaStream wraps a driver handle bound to a device context.
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaFlashState {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaFlashState {}
+
 impl FlashAttention2 {
     /// Create a new FlashAttention-2 backend with default configuration.
     pub fn new() -> Self {
@@ -476,31 +482,45 @@ impl FlashAttention2 {
             };
 
             unsafe {
-                func.launch_on_stream(
-                    &state.stream,
-                    cfg,
-                    (
-                        &d_output,
-                        &d_query,
-                        &d_key,
-                        &d_val,
-                        &d_block_tables,
-                        &d_context_lens,
-                        &d_seq_starts,
-                        scale,
-                        num_heads as i32,
-                        num_kv_heads as i32,
-                        head_dim as i32,
-                        block_size as i32,
-                        max_context_len as i32,
-                        max_blocks_per_seq as i32,
-                        num_tokens as i32,
-                        if self.config.causal { 1i32 } else { 0i32 },
-                    ),
-                )
-                .map_err(|e| {
-                    LLMError::GpuError(format!("flash_attention_2_kernel launch: {e}"))
-                })?;
+                use cudarc::driver::DevicePtr;
+                let mut p_scale = scale;
+                let mut p_num_heads = num_heads as i32;
+                let mut p_num_kv_heads = num_kv_heads as i32;
+                let mut p_head_dim = head_dim as i32;
+                let mut p_block_size = block_size as i32;
+                let mut p_max_ctx = max_context_len as i32;
+                let mut p_max_blocks = max_blocks_per_seq as i32;
+                let mut p_num_tokens = num_tokens as i32;
+                let mut p_causal: i32 = if self.config.causal { 1 } else { 0 };
+                let mut d_output_ptr = *DevicePtr::device_ptr(&d_output);
+                let mut d_query_ptr = *DevicePtr::device_ptr(&d_query);
+                let mut d_key_ptr = *DevicePtr::device_ptr(&d_key);
+                let mut d_val_ptr = *DevicePtr::device_ptr(&d_val);
+                let mut d_bt_ptr = *DevicePtr::device_ptr(&d_block_tables);
+                let mut d_cl_ptr = *DevicePtr::device_ptr(&d_context_lens);
+                let mut d_ss_ptr = *DevicePtr::device_ptr(&d_seq_starts);
+                let params: &mut [*mut std::ffi::c_void] = &mut [
+                    &mut d_output_ptr as *mut _ as *mut _,
+                    &mut d_query_ptr as *mut _ as *mut _,
+                    &mut d_key_ptr as *mut _ as *mut _,
+                    &mut d_val_ptr as *mut _ as *mut _,
+                    &mut d_bt_ptr as *mut _ as *mut _,
+                    &mut d_cl_ptr as *mut _ as *mut _,
+                    &mut d_ss_ptr as *mut _ as *mut _,
+                    &mut p_scale as *mut f32 as *mut _,
+                    &mut p_num_heads as *mut i32 as *mut _,
+                    &mut p_num_kv_heads as *mut i32 as *mut _,
+                    &mut p_head_dim as *mut i32 as *mut _,
+                    &mut p_block_size as *mut i32 as *mut _,
+                    &mut p_max_ctx as *mut i32 as *mut _,
+                    &mut p_max_blocks as *mut i32 as *mut _,
+                    &mut p_num_tokens as *mut i32 as *mut _,
+                    &mut p_causal as *mut i32 as *mut _,
+                ];
+                func.launch_on_stream(&state.stream, cfg, params)
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("flash_attention_2_kernel launch: {e}"))
+                    })?;
             }
         }
 

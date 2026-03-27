@@ -13,7 +13,7 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaDevice, CudaFunction, CudaSlice, CudaStream, LaunchAsync, LaunchConfig,
+        CudaDevice, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig,
     };
     use tracing::trace;
 
@@ -87,13 +87,19 @@ mod inner {
         ) -> Result<()> {
             let n = data.len();
             let cfg = launch_cfg(n as u32);
-            // SAFETY: The silu_kernel reads input[idx] then writes output[idx] per thread.
-            // Each thread handles exactly one independent element, so aliasing output==input
-            // is safe -- the read completes before the write within a single thread.
+            // SAFETY: In-place: output==input is safe for element-wise SiLU.
+            // Use raw pointer to avoid Rust borrow conflict on aliased output/input.
             unsafe {
+                let mut ptr = *DevicePtrMut::device_ptr_mut(data);
+                let mut n_i32 = n as i32;
+                let params: &mut [*mut std::ffi::c_void] = &mut [
+                    &mut ptr as *mut _ as *mut _,  // output
+                    &mut ptr as *mut _ as *mut _,  // input (aliased)
+                    &mut n_i32 as *mut _ as *mut _,
+                ];
                 self.func
                     .clone()
-                    .launch_on_stream(stream, cfg, (data, &*data, n as i32))
+                    .launch_on_stream(stream, cfg, params)
                     .map_err(|e| {
                         LLMError::GpuError(format!("silu_kernel inplace launch failed: {e}"))
                     })?;
@@ -160,9 +166,16 @@ mod inner {
             let cfg = launch_cfg(n as u32);
             // SAFETY: pure element-wise -- same aliasing rationale as CudaSiLU::forward_inplace.
             unsafe {
+                let mut ptr = *DevicePtrMut::device_ptr_mut(data);
+                let mut n_i32 = n as i32;
+                let params: &mut [*mut std::ffi::c_void] = &mut [
+                    &mut ptr as *mut _ as *mut _,
+                    &mut ptr as *mut _ as *mut _,
+                    &mut n_i32 as *mut _ as *mut _,
+                ];
                 self.func
                     .clone()
-                    .launch_on_stream(stream, cfg, (data, &*data, n as i32))
+                    .launch_on_stream(stream, cfg, params)
                     .map_err(|e| {
                         LLMError::GpuError(format!("gelu_kernel inplace launch failed: {e}"))
                     })?;
@@ -252,13 +265,20 @@ mod inner {
                 )));
             }
             let cfg = launch_cfg(n as u32);
-            // SAFETY: output ptr aliases gate. The kernel reads gate[idx] then writes
-            // output[idx] for the same idx in a single thread -- no cross-element deps,
-            // so in-place aliasing is safe for this element-wise operation.
+            // SAFETY: output aliases gate for in-place element-wise op.
             unsafe {
+                let mut gate_ptr = *DevicePtrMut::device_ptr_mut(gate);
+                let mut up_ptr = *DevicePtr::device_ptr(up);
+                let mut n_i32 = n as i32;
+                let params: &mut [*mut std::ffi::c_void] = &mut [
+                    &mut gate_ptr as *mut _ as *mut _,  // output (aliases gate)
+                    &mut gate_ptr as *mut _ as *mut _,  // gate input
+                    &mut up_ptr as *mut _ as *mut _,     // up input
+                    &mut n_i32 as *mut _ as *mut _,
+                ];
                 self.func
                     .clone()
-                    .launch_on_stream(stream, cfg, (gate, &*gate, up, n as i32))
+                    .launch_on_stream(stream, cfg, params)
                     .map_err(|e| {
                         LLMError::GpuError(format!(
                             "fused_silu_mul_kernel inplace launch failed: {e}"

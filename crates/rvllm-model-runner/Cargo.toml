@@ -13,7 +13,7 @@ categories = ["science", "hardware-support"]
 
 [features]
 default = []
-cuda = ["rvllm-gpu/cuda", "rvllm-attention/cuda", "rvllm-model-loader/cuda", "rvllm-kv-cache/cuda"]
+cuda = ["rvllm-gpu/cuda", "rvllm-attention/cuda", "rvllm-model-loader/cuda", "rvllm-kv-cache/cuda", "dep:cudarc"]
 
 [dependencies]
 rvllm-core.workspace = true
@@ -24,3 +24,4 @@ rvllm-model-loader.workspace = true
 thiserror.workspace = true
 half.workspace = true
 tracing.workspace = true
+cudarc = { version = "0.12", features = ["driver", "cublas", "cuda-version-from-build-system"], optional = true }

@@ -10,6 +10,8 @@ pub mod engine;
 pub mod fp8_cache;
 pub mod ops;
 #[cfg(feature = "cuda")]
+pub mod engine_cuda;
+#[cfg(feature = "cuda")]
 pub mod ops_cuda;
 
 pub use cache::{CacheConfig, KVCache};

@@ -11,7 +11,7 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchAsync, LaunchConfig,
+        CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, DeviceSlice as _, LaunchAsync, LaunchConfig,
     };
     use tracing::debug;
 
