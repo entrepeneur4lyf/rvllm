@@ -15,6 +15,7 @@ use crate::Result;
 static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     ("activation", &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"]),
     ("copy_blocks", &["copy_blocks_kernel"]),
+    ("flash_attention", &["flash_attention_2_kernel", "flash_attention_2_decode_kernel"]),
     ("paged_attention", &["paged_attention_v2_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),
     ("rotary_embedding", &["rotary_embedding_kernel"]),

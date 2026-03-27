@@ -271,10 +271,12 @@ mod inner {
             // The kernel reads `input`, `weight`, writes `output`.
             let module_name = "rms_norm";
             let func_name = "rms_norm_kernel";
+            let block_threads = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
                 grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (hidden_size.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (block_threads, 1, 1),
+                // kernel uses extern __shared__ float sdata[blockDim.x]
+                shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
             };
 
             // SAFETY: All CudaSlice pointers are valid device memory allocated on
@@ -417,32 +419,33 @@ mod inner {
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-            // TODO: First, write new K,V into cache via reshape_and_cache kernel
-            // using slot_mapping. This is Agent 9's responsibility (ops_cuda.rs).
-            // For now, we assume the cache has already been populated for decode,
-            // and during prefill the scheduler handles cache writes.
+            // Use FA2 decode kernel: correct block-level reductions, GQA support.
+            // FA2_BC=64, FA2_THREADS=128 (compile-time constants in flash_attention.cu)
+            const FA2_BC: usize = 64;
+            const FA2_THREADS: u32 = 128;
+            // smem: s_key[FA2_BC*head_dim] + s_val[FA2_BC*head_dim] + s_score[FA2_BC] + s_reduce[FA2_THREADS/32]
+            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32)) * std::mem::size_of::<f32>()) as u32;
 
-            let module_name = "paged_attention";
-            let func_name = "paged_attention_v1_kernel";
+            let module_name = "flash_attention";
+            let func_name = "flash_attention_2_decode_kernel";
 
-            // Launch config: one block per (seq, head), threads cover the
-            // head_dim for accumulation.
             let cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                block_dim: (head_dim.min(1024) as u32, 1, 1),
-                shared_mem_bytes: 0,
+                block_dim: (FA2_THREADS, 1, 1),
+                shared_mem_bytes,
             };
 
             let kernel = device
                 .get_func(module_name, func_name)
                 .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
 
-            // SAFETY: All slices are valid GPU memory on the same device.
-            // output: [num_tokens, num_heads, head_dim]
-            // q: [num_tokens, num_heads, head_dim]
-            // key_cache, value_cache: [num_blocks, num_kv_heads, head_dim, block_size]
+            // SAFETY: All slices are valid GPU memory on this device.
+            // output: [num_seqs, num_heads, head_dim]
+            // q:      [num_seqs, num_heads, head_dim]  (decode: num_seqs == num_tokens)
+            // key_cache, value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
             // block_tables: [num_seqs, max_blocks_per_seq]
             // context_lens: [num_seqs]
+            // Scalar int args cast from usize; all values fit in i32 range.
             unsafe {
                 kernel
                     .launch(
@@ -455,14 +458,15 @@ mod inner {
                             &block_tables,
                             &context_lens,
                             scale,
-                            num_heads as u32,
-                            num_kv_heads as u32,
-                            head_dim as u32,
-                            block_size as u32,
-                            max_context_len,
+                            num_heads as i32,
+                            num_kv_heads as i32,
+                            head_dim as i32,
+                            block_size as i32,
+                            // max_blocks_per_seq: block_tables row width
+                            (block_tables.len() / num_seqs.max(1)) as i32,
                         ),
                     )
-                    .map_err(|e| LLMError::GpuError(format!("paged_attention launch failed: {e}")))?;
+                    .map_err(|e| LLMError::GpuError(format!("flash_attention_2_decode launch failed: {e}")))?;
             }
 
             Ok(output)
