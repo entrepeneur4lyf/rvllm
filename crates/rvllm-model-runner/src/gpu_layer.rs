@@ -18,7 +18,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaSlice, CudaStream, CudaView, DeviceSlice, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{info, trace};
 
@@ -180,120 +180,90 @@ mod inner {
                 &self.stream, &normed, num_tokens * hidden, &cast_f32_f16,
             )?;
 
-            let (mut q, mut k, mut v) = if let Some(fused_qkv) = weights.fused_qkv {
-                // Fused QKV: single GEMM [num_tokens, hidden] x [qkv_dim, hidden]^T -> [num_tokens, qkv_dim]
-                let qkv = CudaLinearLayer::forward_f16_in(
+            // Fused QKV: 1 GEMM, zero-copy split via views. No separate allocs or copies.
+            let mut qkv = if let Some(fused_qkv) = weights.fused_qkv {
+                CudaLinearLayer::forward_f16_in(
                     &normed_f16, fused_qkv, num_tokens, qkv_dim, hidden, blas,
-                )?;
-                // Split output: Q [0..q_dim], K [q_dim..q_dim+kv_dim], V [q_dim+kv_dim..]
-                // For num_tokens=1 (decode), output is [qkv_dim] contiguous.
-                // For batched, output is [num_tokens, qkv_dim] row-major.
+                )?
+            } else {
+                // Unfused fallback: 3 GEMMs into a contiguous buffer
+                let mut qkv_buf = unsafe { self.stream.alloc::<f32>(num_tokens * qkv_dim) }
+                    .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
                 let q_end = num_tokens * q_dim;
                 let k_end = q_end + num_tokens * kv_dim;
-                let v_end = k_end + num_tokens * kv_dim;
-                // Need owned CudaSlice for each split (for &mut in RoPE).
-                // Copy from the fused output into separate buffers.
-                let mut q_buf = self.stream.alloc_zeros::<f32>(num_tokens * q_dim)
-                    .map_err(|e| LLMError::GpuError(format!("q split alloc: {e}")))?;
-                let mut k_buf = self.stream.alloc_zeros::<f32>(num_tokens * kv_dim)
-                    .map_err(|e| LLMError::GpuError(format!("k split alloc: {e}")))?;
-                let mut v_buf = self.stream.alloc_zeros::<f32>(num_tokens * kv_dim)
-                    .map_err(|e| LLMError::GpuError(format!("v split alloc: {e}")))?;
-                self.stream.memcpy_dtod(&qkv.slice(..q_end), &mut q_buf)
-                    .map_err(|e| LLMError::GpuError(format!("q split copy: {e}")))?;
-                self.stream.memcpy_dtod(&qkv.slice(q_end..k_end), &mut k_buf)
-                    .map_err(|e| LLMError::GpuError(format!("k split copy: {e}")))?;
-                self.stream.memcpy_dtod(&qkv.slice(k_end..v_end), &mut v_buf)
-                    .map_err(|e| LLMError::GpuError(format!("v split copy: {e}")))?;
-                (q_buf, k_buf, v_buf)
-            } else {
-                // Unfused: 3 separate GEMMs (fallback)
-                let q = CudaLinearLayer::forward_f16_in(
-                    &normed_f16, weights.q_proj, num_tokens, q_dim, hidden, blas,
-                )?;
-                let k = CudaLinearLayer::forward_f16_in(
-                    &normed_f16, weights.k_proj, num_tokens, kv_dim, hidden, blas,
-                )?;
-                let v = CudaLinearLayer::forward_f16_in(
-                    &normed_f16, weights.v_proj, num_tokens, kv_dim, hidden, blas,
-                )?;
-                (q, k, v)
+                {
+                    let mut q_dst = qkv_buf.slice_mut(..q_end);
+                    blas.hgemm_f32_output(num_tokens, q_dim, hidden, 1.0, &normed_f16, weights.q_proj, 0.0, &mut q_dst)?;
+                }
+                {
+                    let mut k_dst = qkv_buf.slice_mut(q_end..k_end);
+                    blas.hgemm_f32_output(num_tokens, kv_dim, hidden, 1.0, &normed_f16, weights.k_proj, 0.0, &mut k_dst)?;
+                }
+                {
+                    let mut v_dst = qkv_buf.slice_mut(k_end..);
+                    blas.hgemm_f32_output(num_tokens, kv_dim, hidden, 1.0, &normed_f16, weights.v_proj, 0.0, &mut v_dst)?;
+                }
+                qkv_buf
             };
 
-            // QKV biases (f32)
+            // Apply biases in-place on QKV buffer slices (no separate allocs)
+            let q_end = num_tokens * q_dim;
+            let k_end = q_end + num_tokens * kv_dim;
             if let Some(bias) = weights.q_proj_bias {
-                Self::add_bias(&self.stream, &self.loader, &mut q, bias, num_tokens, q_dim)?;
+                let mut q_view = qkv.slice_mut(..q_end);
+                Self::add_bias_view(&self.stream, &self.loader, &mut q_view, bias, num_tokens, q_dim)?;
             }
             if let Some(bias) = weights.k_proj_bias {
-                Self::add_bias(&self.stream, &self.loader, &mut k, bias, num_tokens, kv_dim)?;
+                let mut k_view = qkv.slice_mut(q_end..k_end);
+                Self::add_bias_view(&self.stream, &self.loader, &mut k_view, bias, num_tokens, kv_dim)?;
             }
             if let Some(bias) = weights.v_proj_bias {
-                Self::add_bias(&self.stream, &self.loader, &mut v, bias, num_tokens, kv_dim)?;
+                let mut v_view = qkv.slice_mut(k_end..);
+                Self::add_bias_view(&self.stream, &self.loader, &mut v_view, bias, num_tokens, kv_dim)?;
             }
 
-            // 3. RoPE (in-place on q and k)
-            Self::apply_rotary_embedding_inplace(
-                &self.stream,
-                &self.loader,
-                &mut q,
-                &mut k,
-                &input.positions,
-                input.rope_cos,
-                input.rope_sin,
-                num_tokens,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-            )?;
+            // 3. RoPE in-place on Q and K regions of QKV buffer
+            {
+                let mut q_view = qkv.slice_mut(..q_end);
+                let mut k_view = qkv.slice_mut(q_end..k_end);
+                Self::apply_rotary_embedding_inplace_views(
+                    &self.stream, &self.loader,
+                    &mut q_view, &mut k_view,
+                    &input.positions, input.rope_cos, input.rope_sin,
+                    num_tokens, num_heads, num_kv_heads, head_dim,
+                )?;
+            }
 
-            // 4. KV cache write + attention
-            Self::cache_write(
-                &self.stream,
-                &self.loader,
-                &k,
-                &v,
-                input.key_cache,
-                input.value_cache,
-                &input.slot_mapping,
-                num_tokens,
-                num_kv_heads,
-                head_dim,
-            )?;
+            // 4. KV cache write using views (no copy)
+            {
+                let k_view = qkv.slice(q_end..k_end);
+                let v_view = qkv.slice(k_end..);
+                Self::cache_write_views(
+                    &self.stream, &self.loader,
+                    &k_view, &v_view,
+                    input.key_cache, input.value_cache, &input.slot_mapping,
+                    num_tokens, num_kv_heads, head_dim,
+                )?;
+            }
 
+            // Attention using Q view
             let attn_out = if input.is_prefill {
                 Self::prefill_attention(
-                    &self.stream,
-                    &self.loader,
-                    &q,
-                    input.key_cache,
-                    input.value_cache,
-                    &input.block_tables,
-                    &input.context_lens,
-                    &input.seq_start_pos,
-                    num_tokens,
-                    input.num_seqs,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    input.max_context_len,
-                    input.block_size,
+                    &self.stream, &self.loader,
+                    &qkv.slice(..q_end),
+                    input.key_cache, input.value_cache,
+                    &input.block_tables, &input.context_lens, &input.seq_start_pos,
+                    num_tokens, input.num_seqs, num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size,
                 )?
             } else {
                 Self::decode_attention(
-                    &self.stream,
-                    &self.loader,
-                    &q,
-                    input.key_cache,
-                    input.value_cache,
-                    &input.block_tables,
-                    &input.context_lens,
-                    num_tokens,
-                    input.num_seqs,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    input.max_context_len,
-                    input.block_size,
+                    &self.stream, &self.loader,
+                    &qkv.slice(..q_end),
+                    input.key_cache, input.value_cache,
+                    &input.block_tables, &input.context_lens,
+                    num_tokens, input.num_seqs, num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size,
                 )?
             };
 
@@ -470,7 +440,7 @@ mod inner {
                 Self::prefill_attention(
                     &self.stream,
                     &self.loader,
-                    &q,
+                    &q.as_view(),
                     input.key_cache,
                     input.value_cache,
                     &input.block_tables,
@@ -490,7 +460,7 @@ mod inner {
                 Self::decode_attention(
                     &self.stream,
                     &self.loader,
-                    &q,
+                    &q.as_view(),
                     input.key_cache,
                     input.value_cache,
                     &input.block_tables,
@@ -655,6 +625,101 @@ mod inner {
                     .arg(&dim_i32)
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("add_bias launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// add_bias on a CudaViewMut (for QKV buffer slices).
+        fn add_bias_view(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            tensor: &mut CudaViewMut<'_, f32>,
+            bias: &CudaSlice<f32>,
+            num_tokens: usize,
+            dim: usize,
+        ) -> Result<()> {
+            let kernel = loader.get_func("add_bias", "add_bias_kernel")?;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (dim.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let dim_i32 = dim as i32;
+            unsafe {
+                stream.launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(bias)
+                    .arg(&dim_i32)
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("add_bias_view launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// RoPE on CudaViewMut Q/K slices from the contiguous QKV buffer.
+        fn apply_rotary_embedding_inplace_views(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            q: &mut CudaViewMut<'_, f32>,
+            k: &mut CudaViewMut<'_, f32>,
+            positions: &CudaView<'_, i32>,
+            rope_cos: &CudaSlice<f32>,
+            rope_sin: &CudaSlice<f32>,
+            num_tokens: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            if num_tokens == 0 { return Ok(()); }
+            let kernel = loader.get_func("rotary_embedding", "rotary_embedding_kernel")?;
+            let half_dim = head_dim / 2;
+            let grid_y = num_heads.max(num_kv_heads) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, grid_y, 1),
+                block_dim: (half_dim.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream.launch_builder(&kernel)
+                    .arg(q).arg(k)
+                    .arg(rope_cos).arg(rope_sin).arg(positions)
+                    .arg(&(num_tokens as i32)).arg(&(num_heads as i32))
+                    .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("rope views launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// cache_write using CudaView K/V from contiguous QKV buffer.
+        fn cache_write_views(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            k: &CudaView<'_, f32>,
+            v: &CudaView<'_, f32>,
+            key_cache: &CudaSlice<f16>,
+            value_cache: &CudaSlice<f16>,
+            slot_mapping: &CudaView<'_, i32>,
+            num_tokens: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            let kv_dim = num_kv_heads * head_dim;
+            let kernel = loader.get_func("reshape_and_cache", "reshape_and_cache_f16_kernel")?;
+            let threads = kv_dim.min(1024) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                stream.launch_builder(&kernel)
+                    .arg(k).arg(v)
+                    .arg(key_cache).arg(value_cache)
+                    .arg(slot_mapping)
+                    .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("cache_write_views launch: {e}")))?;
             }
             Ok(())
         }
@@ -964,7 +1029,7 @@ mod inner {
         fn prefill_attention(
             stream: &Arc<CudaStream>,
             loader: &KernelLoader,
-            q: &CudaSlice<f32>,
+            q: &CudaView<'_, f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
             block_tables: &CudaView<'_, i32>,
@@ -1076,7 +1141,7 @@ mod inner {
         fn decode_attention(
             stream: &Arc<CudaStream>,
             loader: &KernelLoader,
-            q: &CudaSlice<f32>,
+            q: &CudaView<'_, f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
             block_tables: &CudaView<'_, i32>,
