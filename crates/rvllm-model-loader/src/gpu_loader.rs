@@ -267,12 +267,12 @@ mod inner {
     }
 
     /// Extract dtype, shape, and byte slice for a single tensor from header metadata.
-    fn parse_tensor_meta<'a>(
-        meta: &serde_json::Value,
+    fn parse_tensor_meta<'a, 'b>(
+        meta: &'b serde_json::Value,
         name: &str,
         data: &'a [u8],
         data_start: usize,
-    ) -> Result<(&'a str, Vec<usize>, &'a [u8])> {
+    ) -> Result<(&'b str, Vec<usize>, &'a [u8])> {
         let obj = meta.as_object().ok_or_else(|| {
             LLMError::ModelError(format!("tensor {} has non-object meta", name))
         })?;
