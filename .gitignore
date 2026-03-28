@@ -9,6 +9,11 @@ target/
 *.swo
 *~
 .env
+
+# IDE configs
+.idea/
+.vscode/
+*.iml
 .instance_id
 results_*.json
 __pycache__/
@@ -28,3 +33,4 @@ build/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+.gitnexus

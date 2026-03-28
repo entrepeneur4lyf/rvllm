@@ -1,4 +1,4 @@
-.PHONY: build build-cuda check check-cuda test test-cuda kernels bench bench-python bench-compare docker deploy-provision deploy-push deploy-bench deploy-teardown a100-bench loc clean
+.PHONY: build build-cuda check check-cuda test test-cuda kernels bench bench-python bench-compare docker deploy-provision deploy-push deploy-bench deploy-teardown a100-bench loc clean setup lint fmt
 
 # Local development (Mac, mock-gpu)
 build:
@@ -65,6 +65,20 @@ loc:
 	@find crates -name "*.rs" | xargs wc -l | tail -1
 	@echo "CUDA kernels:"
 	@find kernels -name "*.cu" 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 || echo "  0 lines"
+
+# Install pre-commit hooks
+setup:
+	git config core.hooksPath .githooks
+	@echo "Pre-commit hooks installed."
+
+# Format
+fmt:
+	cargo fmt --all
+
+# Lint
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --workspace -- -D warnings
 
 # Clean
 clean:
