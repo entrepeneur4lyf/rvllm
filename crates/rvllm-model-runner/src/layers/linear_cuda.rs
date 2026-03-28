@@ -13,6 +13,8 @@ use half::f16;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 use rvllm_gpu::cublas_ops::CublasOps;
+#[cfg(feature = "cublaslt")]
+use rvllm_gpu::cublaslt_ops::{CublasLtOps, CUBLASLT_M_THRESHOLD};
 use std::sync::Arc;
 
 /// GPU-accelerated dense linear projection using cuBLAS SGEMM.
@@ -164,6 +166,46 @@ impl CudaLinearLayer {
         )?;
 
         // Cast output f16 -> f32
+        Self::gpu_cast_f16_to_f32(stream, &output_f16, m * n, &cast_f16_f32)
+    }
+
+    /// Static forward with f16 weights using cublasLt for decode-sized batches.
+    ///
+    /// When `cublaslt` feature is enabled and `m <= CUBLASLT_M_THRESHOLD`,
+    /// uses cublasLt's heuristic algo selection (with workspace + split-K)
+    /// for better decode performance. Falls back to standard cuBLAS hgemm
+    /// for larger batches.
+    #[cfg(feature = "cublaslt")]
+    pub fn forward_once_f16_lt(
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f16>,
+        m: usize,
+        n: usize,
+        k: usize,
+        blas: &CublasHandle,
+        lt: &CublasLtOps,
+        loader: &rvllm_gpu::kernel_loader::KernelLoader,
+    ) -> Result<CudaSlice<f32>> {
+        // For large M (prefill), standard cuBLAS is fine -- less overhead.
+        if m > CUBLASLT_M_THRESHOLD {
+            return Self::forward_once_f16(input, weight, m, n, k, blas, loader);
+        }
+
+        let stream = blas.stream();
+
+        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
+            .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
+        let cast_f16_f32 = loader.get_func("cast_fp", "cast_f16_to_f32_kernel")
+            .map_err(|e| LLMError::GpuError(format!("load cast_f16_to_f32_kernel: {e}")))?;
+
+        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
+
+        let mut output_f16 = stream
+            .alloc_zeros::<f16>(m * n)
+            .map_err(|e| LLMError::GpuError(format!("forward_once_f16_lt alloc: {e}")))?;
+
+        lt.hgemm_a_bt(m, n, k, 1.0, &input_f16, weight, 0.0, &mut output_f16)?;
+
         Self::gpu_cast_f16_to_f32(stream, &output_f16, m * n, &cast_f16_f32)
     }
 

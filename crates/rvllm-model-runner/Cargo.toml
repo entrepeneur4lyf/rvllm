@@ -14,6 +14,7 @@ categories = ["science", "hardware-support"]
 [features]
 default = []
 cuda = ["rvllm-gpu/cuda", "rvllm-attention/cuda", "rvllm-model-loader/cuda", "rvllm-kv-cache/cuda", "dep:cudarc"]
+cublaslt = ["cuda", "rvllm-gpu/cublaslt"]
 
 [dependencies]
 rvllm-core.workspace = true

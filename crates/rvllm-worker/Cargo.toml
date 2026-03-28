@@ -14,6 +14,7 @@ categories = ["concurrency", "hardware-support"]
 [features]
 default = []
 cuda = ["dep:cudarc", "rvllm-gpu/cuda", "rvllm-model-runner/cuda", "rvllm-kv-cache/cuda", "rvllm-sampling/cuda", "rvllm-model-loader/cuda"]
+cublaslt = ["cuda", "rvllm-gpu/cublaslt", "rvllm-model-runner/cublaslt"]
 
 [dependencies]
 cudarc = { version = "0.19", features = ["driver", "cublas", "f16"], optional = true }

@@ -18,6 +18,7 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["rvllm-gpu/cuda", "rvllm-api/cuda", "rvllm-engine/cuda"]
+cublaslt = ["cuda", "rvllm-gpu/cublaslt", "rvllm-engine/cublaslt"]
 
 [dependencies]
 rvllm-core.workspace = true
