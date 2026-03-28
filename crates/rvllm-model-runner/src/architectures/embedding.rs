@@ -437,6 +437,7 @@ mod tests {
             vocab_size: 32,
             max_position: 512,
             dtype: "float16".into(),
+            rope_theta: 10000.0,
             architecture: "EmbeddingModel".into(),
         }
     }

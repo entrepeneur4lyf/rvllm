@@ -151,7 +151,7 @@ __global__ void flash_attention_2_kernel(
     const int q_start = (seq_start_pos != nullptr) ? seq_start_pos[seq_idx] : seq_idx;
     const int q_len = (seq_start_pos != nullptr && seq_idx + 1 < gridDim.x)
                       ? (seq_start_pos[seq_idx + 1] - q_start)
-                      : 1;
+                      : (num_query_tokens - q_start);
 
     // ---- Shared memory layout ----
     // We partition shared memory as:

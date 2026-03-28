@@ -465,6 +465,7 @@ mod tests {
             vocab_size: 32,
             max_position: 128,
             dtype: "float16".into(),
+            rope_theta: 10000.0,
             architecture: "GPTNeoXForCausalLM".into(),
         }
     }

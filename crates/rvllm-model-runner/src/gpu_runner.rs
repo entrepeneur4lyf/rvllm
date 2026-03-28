@@ -101,7 +101,7 @@ mod cuda_impl {
             let head_dim = config.head_dim;
             let max_pos = config.max_position.min(8192);
             let half_dim = head_dim / 2;
-            let rope_theta = 1_000_000.0f32; // Qwen2.5 default
+            let rope_theta = config.rope_theta;
             let mut cos_table = vec![0.0f32; max_pos * half_dim];
             let mut sin_table = vec![0.0f32; max_pos * half_dim];
             for pos in 0..max_pos {
@@ -155,31 +155,34 @@ mod cuda_impl {
 
             debug!(num_tokens, num_seqs, is_prefill, "GpuModelRunner::forward");
 
-            // Upload positions to GPU
-            let positions_gpu: CudaSlice<u32> = self.device
-                .htod_sync_copy(positions)
+            // Upload positions to GPU as i32 (CUDA kernels expect int*)
+            let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
+            let positions_gpu: CudaSlice<i32> = self.device
+                .htod_sync_copy(&pos_i32)
                 .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
 
-            // Upload context_lens to GPU
-            let context_lens_gpu: CudaSlice<u32> = self.device
-                .htod_sync_copy(&attn_meta.context_lens)
+            // Upload context_lens as i32
+            let cl_i32: Vec<i32> = attn_meta.context_lens.iter().map(|&c| c as i32).collect();
+            let context_lens_gpu: CudaSlice<i32> = self.device
+                .htod_sync_copy(&cl_i32)
                 .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
 
-            // Flatten block_tables to [num_seqs, max_blocks_per_seq] row-major
+            // Flatten block_tables to [num_seqs, max_blocks_per_seq] row-major as i32
             let max_blocks = attn_meta.block_tables.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-            let mut flat_bt = vec![0u32; num_seqs * max_blocks];
+            let mut flat_bt = vec![0i32; num_seqs * max_blocks];
             for (s, row) in attn_meta.block_tables.iter().enumerate() {
                 for (b, &blk) in row.iter().enumerate() {
-                    flat_bt[s * max_blocks + b] = blk;
+                    flat_bt[s * max_blocks + b] = blk as i32;
                 }
             }
-            let block_tables_gpu: CudaSlice<u32> = self.device
+            let block_tables_gpu: CudaSlice<i32> = self.device
                 .htod_sync_copy(&flat_bt)
                 .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
 
-            // Upload real slot_mapping
-            let slot_mapping_gpu: CudaSlice<u32> = self.device
-                .htod_sync_copy(&attn_meta.slot_mapping)
+            // Upload slot_mapping as i32
+            let sm_i32: Vec<i32> = attn_meta.slot_mapping.iter().map(|&s| s as i32).collect();
+            let slot_mapping_gpu: CudaSlice<i32> = self.device
+                .htod_sync_copy(&sm_i32)
                 .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
 
             let max_context_len = attn_meta.max_context_len;
@@ -187,6 +190,12 @@ mod cuda_impl {
             // Metadata dump (first call only)
             static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             let probe = !PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
+
+            // Decode-specific probe (first decode call only)
+            static DECODE_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let decode_probe = !is_prefill && !DECODE_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
+            // Reset if this was a prefill call (only arm on actual decode)
+            if is_prefill { DECODE_PROBED.store(false, std::sync::atomic::Ordering::Relaxed); }
             if probe {
                 info!(
                     ?token_ids,
@@ -200,6 +209,19 @@ mod cuda_impl {
                     "PROBE metadata"
                 );
             }
+            if decode_probe {
+                info!(
+                    ?token_ids,
+                    ?positions,
+                    slot_mapping = ?&attn_meta.slot_mapping,
+                    context_lens = ?&attn_meta.context_lens,
+                    block_tables = ?&attn_meta.block_tables,
+                    max_context_len,
+                    max_blocks,
+                    is_prefill,
+                    "DECODE_PROBE metadata"
+                );
+            }
 
             // Step 1: token embedding lookup
             info!("gpu_runner: embedding lookup");
@@ -207,6 +229,10 @@ mod cuda_impl {
             if probe {
                 let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
                 info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "PROBE embed");
+            }
+            if decode_probe {
+                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
+                info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "DECODE_PROBE embed");
             }
 
             // Step 2: transformer layers
@@ -257,9 +283,28 @@ mod cuda_impl {
                         "PROBE cache block0"
                     );
                 }
+                if decode_probe && layer_idx == 0 {
+                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
+                    let nan = h.iter().any(|v| v.is_nan());
+                    let mx = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    info!(nan, max = mx, first5 = ?&h[..5.min(h.len())], "DECODE_PROBE layer0 output");
+                }
+                if probe && layer_idx == num_layers - 1 {
+                    // Dump last token's hidden state after final layer
+                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let last_start = (num_tokens - 1) * hidden_size;
+                    let last_h = &h[last_start..last_start + hidden_size];
+                    let mx = last_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mn = last_h.iter().cloned().fold(f32::INFINITY, f32::min);
+                    info!(layer = layer_idx, last_max = mx, last_min = mn, first5 = ?&last_h[..5.min(last_h.len())], "PROBE last-layer last-token hidden");
+                }
                 if layer_idx == 0 || layer_idx == num_layers - 1 {
                     info!(layer = layer_idx, "gpu_runner: layer done");
                 }
+            }
+            if decode_probe {
+                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
+                info!(first5 = ?&h[..5.min(h.len())], "DECODE_PROBE final hidden state");
             }
 
             // Step 3: final RMSNorm
@@ -271,6 +316,10 @@ mod cuda_impl {
                 &self.loader,
                 &self.stream,
             )?;
+
+            // Sync before LM head: RMSNorm runs on self.stream, cuBLAS on default stream
+            self.device.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("pre-LM-head sync: {e}")))?;
 
             // Step 4: LM head  normed [num_tokens, hidden] @ lm_head^T [hidden, vocab]
             let logits_gpu = CudaLinearLayer::forward_once(
@@ -288,6 +337,34 @@ mod cuda_impl {
                 .dtoh_sync_copy(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
 
+            if decode_probe {
+                let argmax = logits_cpu.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0);
+                let mut top5: Vec<(usize, f32)> = logits_cpu.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                top5.truncate(5);
+                info!(
+                    logits_len = logits_cpu.len(),
+                    argmax_token = argmax,
+                    top5 = ?top5,
+                    "DECODE_PROBE logits"
+                );
+            }
+
+            if probe {
+                // Last token's logits (what sampler uses)
+                let last_start = (num_tokens - 1) * vocab_size;
+                let last_logits = &logits_cpu[last_start..last_start + vocab_size];
+                let local_argmax = last_logits.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i).unwrap_or(0);
+                let mut top5: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                top5.truncate(5);
+                let last_max = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let last_min = last_logits.iter().cloned().fold(f32::INFINITY, f32::min);
+                let nan = last_logits.iter().any(|v| v.is_nan());
+                info!(num_tokens, vocab_size, local_argmax, nan, last_min, last_max, top5 = ?top5, "PROBE prefill last-token logits");
+            }
             debug!(logits_len = logits_cpu.len(), expected = num_tokens * vocab_size, "forward complete");
             Ok(logits_cpu)
         }
@@ -424,6 +501,7 @@ mod tests {
                 intermediate_size: 128,
                 vocab_size: 100,
                 max_position: 512,
+                rope_theta: 10000.0,
                 dtype: "float32".to_string(),
                 architecture: "LlamaForCausalLM".to_string(),
             };
@@ -448,6 +526,7 @@ mod tests {
                 intermediate_size: 512,
                 vocab_size: 32000,
                 max_position: 2048,
+                rope_theta: 10000.0,
                 dtype: "float16".to_string(),
                 architecture: "LlamaForCausalLM".to_string(),
             };

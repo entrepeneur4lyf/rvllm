@@ -184,31 +184,41 @@ mod inner {
     // ------------------------------------------------------------------
 
     struct FifoScheduler {
-        groups: Vec<SequenceGroup>,
+        /// Waiting queue: groups not yet scheduled.
+        waiting: Vec<SequenceGroup>,
+        /// Running queue: groups currently being executed (already scheduled).
+        running: Vec<SequenceGroup>,
         max_num_seqs: usize,
         max_num_batched_tokens: usize,
     }
 
     impl FifoScheduler {
         fn new(max_num_seqs: usize, max_num_batched_tokens: usize) -> Self {
-            Self { groups: Vec::new(), max_num_seqs, max_num_batched_tokens }
+            Self { waiting: Vec::new(), running: Vec::new(), max_num_seqs, max_num_batched_tokens }
         }
 
         fn add_seq_group(&mut self, group: SequenceGroup) {
-            self.groups.push(group);
+            self.waiting.push(group);
         }
 
         fn abort_seq_group(&mut self, request_id: &RequestId) {
-            self.groups.retain(|g| g.request_id != *request_id);
+            self.waiting.retain(|g| g.request_id != *request_id);
+            self.running.retain(|g| g.request_id != *request_id);
         }
 
         fn has_unfinished_seqs(&self) -> bool {
-            !self.groups.is_empty()
+            !self.waiting.is_empty() || !self.running.is_empty()
+        }
+
+        fn live_seq_ids(&self) -> std::collections::HashSet<SequenceId> {
+            self.waiting.iter().chain(self.running.iter())
+                .flat_map(|g| g.get_seqs().iter().map(|s| s.seq_id))
+                .collect()
         }
 
         /// Append a generated token to a sequence in the scheduler.
         fn update_seq_token(&mut self, seq_id: SequenceId, token_id: TokenId, logprob: f32) {
-            for group in &mut self.groups {
+            for group in self.running.iter_mut().chain(self.waiting.iter_mut()) {
                 for seq in group.get_seqs_mut() {
                     if seq.seq_id == seq_id {
                         seq.append_token(token_id, logprob);
@@ -219,26 +229,40 @@ mod inner {
         }
 
         fn get_num_unfinished_seq_groups(&self) -> usize {
-            self.groups.len()
+            self.waiting.len() + self.running.len()
         }
 
         fn schedule(&mut self) -> (Vec<SequenceGroup>, usize) {
-            self.groups.retain(|g| !g.is_finished());
+            // Purge finished groups from both queues.
+            self.running.retain(|g| !g.is_finished());
+            self.waiting.retain(|g| !g.is_finished());
 
-            let mut selected = Vec::new();
             let mut total_tokens: usize = 0;
 
-            for group in &self.groups {
-                if selected.len() >= self.max_num_seqs { break; }
+            // Running groups are always re-scheduled (they need their next token).
+            for group in &self.running {
+                let tokens_this: usize = group.get_seqs().iter()
+                    .filter(|s| !s.is_finished())
+                    .map(|s| if s.get_output_len() == 0 { s.get_len() } else { 1 })
+                    .sum();
+                total_tokens += tokens_this;
+            }
+
+            // Promote waiting groups into running up to budget limits.
+            while !self.waiting.is_empty() {
+                if self.running.len() >= self.max_num_seqs { break; }
+                let group = &self.waiting[0];
                 let tokens_this: usize = group.get_seqs().iter()
                     .filter(|s| !s.is_finished())
                     .map(|s| if s.get_output_len() == 0 { s.get_len() } else { 1 })
                     .sum();
                 if total_tokens + tokens_this > self.max_num_batched_tokens { break; }
                 total_tokens += tokens_this;
-                selected.push(group.clone());
+                self.running.push(self.waiting.remove(0));
             }
 
+            // Return clones of running groups for execution.
+            let selected: Vec<SequenceGroup> = self.running.iter().cloned().collect();
             (selected, total_tokens)
         }
     }
@@ -256,6 +280,10 @@ mod inner {
         next_request_id: AtomicU64,
         next_seq_id: u64,
         prefix_cache: Option<PrefixCache>,
+        /// Persistent block allocation for fake sequential allocator.
+        next_block_id: u32,
+        /// Per-sequence block tables that persist across step() calls.
+        seq_block_tables: HashMap<SequenceId, Vec<BlockId>>,
     }
 
     impl GpuLLMEngine {
@@ -357,6 +385,8 @@ mod inner {
                 next_request_id: AtomicU64::new(1),
                 next_seq_id: 0,
                 prefix_cache,
+                next_block_id: 0,
+                seq_block_tables: HashMap::new(),
             })
         }
 
@@ -441,7 +471,7 @@ mod inner {
                 return Ok(Vec::new());
             }
 
-            let metadata = Self::build_metadata(&scheduled_groups, self.config.cache.block_size);
+            let metadata = self.build_metadata(&scheduled_groups);
 
             // Prefix caching: before prefill, check for matching prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {
@@ -554,6 +584,12 @@ mod inner {
                 self.requests.remove(id);
                 self.scheduler.abort_seq_group(id);
             }
+            // Clean up block tables for finished sequences
+            if !finished_ids.is_empty() {
+                let live_seq_ids: std::collections::HashSet<SequenceId> = self.scheduler
+                    .live_seq_ids();
+                self.seq_block_tables.retain(|sid, _| live_seq_ids.contains(sid));
+            }
 
             debug!(num_outputs = results.len(), "GpuLLMEngine: step complete");
             Ok(results)
@@ -586,8 +622,8 @@ mod inner {
             &self.config
         }
 
-        fn build_metadata(groups: &[SequenceGroup], block_size: usize) -> Vec<SequenceGroupMetadata> {
-            let mut next_block: u32 = 0;
+        fn build_metadata(&mut self, groups: &[SequenceGroup]) -> Vec<SequenceGroupMetadata> {
+            let block_size = self.config.cache.block_size;
             let mut metadata = Vec::with_capacity(groups.len());
             for group in groups {
                 let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
@@ -597,16 +633,15 @@ mod inner {
                 for seq in group.get_seqs() {
                     if seq.is_finished() { continue; }
                     let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
-                    let num_blocks = (total_tokens + block_size - 1) / block_size;
+                    let needed_blocks = (total_tokens + block_size - 1) / block_size;
 
-                    let blocks: Vec<BlockId> = (0..num_blocks)
-                        .map(|_| {
-                            let b = BlockId(next_block);
-                            next_block += 1;
-                            b
-                        })
-                        .collect();
-                    block_tables.insert(seq.seq_id, blocks);
+                    // Reuse existing blocks, append new ones if needed
+                    let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
+                    while existing.len() < needed_blocks {
+                        existing.push(BlockId(self.next_block_id));
+                        self.next_block_id += 1;
+                    }
+                    block_tables.insert(seq.seq_id, existing.clone());
 
                     seq_data.insert(seq.seq_id, SequenceData {
                         prompt_token_ids: seq.prompt_token_ids.clone(),

@@ -65,6 +65,7 @@ impl WorkerConfig {
             max_position: self.max_model_len,
             dtype: self.dtype.clone(),
             architecture: self.architecture.clone(),
+            rope_theta: self.rope_theta,
         }
     }
 

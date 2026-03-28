@@ -21,6 +21,7 @@ pub struct ModelRunnerConfig {
     pub intermediate_size: usize,
     pub vocab_size: usize,
     pub max_position: usize,
+    pub rope_theta: f32,
     pub dtype: String,
     pub architecture: String,
 }

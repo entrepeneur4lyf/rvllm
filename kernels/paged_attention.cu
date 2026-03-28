@@ -3,8 +3,8 @@
 // Launch config:
 //   Grid:  (num_seqs, num_heads, 1)
 //   Block: (HEAD_DIM, 1, 1)  -- one thread per dimension element
-//   Shared memory: block_size * sizeof(float) + HEAD_DIM * sizeof(float)
-//                  (for dot products and partial value accumulator)
+//   Shared memory: (block_size + HEAD_DIM + num_warps) * sizeof(float)
+//                  (dot products, partial value accumulator, warp reduction scratch)
 //
 // Each thread block handles one query head for one sequence.
 // Uses online softmax for numerical stability over arbitrary context lengths.
@@ -36,11 +36,16 @@ __global__ void paged_attention_v2_kernel(
     const int num_blocks = (context_len + block_size - 1) / block_size;
 
     // Shared memory layout:
-    //   float logits[block_size]   -- dot products for current block
-    //   float acc[head_dim]        -- running weighted value accumulator
+    //   float logits[block_size]       -- dot products for current block
+    //   float acc[head_dim]            -- running weighted value accumulator
+    //   float warp_partials[num_warps] -- per-warp partial sums for cross-warp reduction
     extern __shared__ float smem[];
-    float* logits = smem;
-    float* acc    = smem + block_size;
+    float* logits        = smem;
+    float* acc           = smem + block_size;
+    const int num_warps  = (head_dim + warpSize - 1) / warpSize;
+    float* warp_partials = smem + block_size + head_dim;
+    const int warp_id    = dim_idx / warpSize;
+    const int lane_id    = dim_idx % warpSize;
 
     // Load query element for this thread
     const int q_offset = (seq_idx * num_heads + head_idx) * head_dim + dim_idx;
@@ -73,10 +78,21 @@ __global__ void paged_attention_v2_kernel(
                 partial += __shfl_down_sync(0xffffffff, partial, offset);
             }
 
-            // First thread of each warp writes to shared memory, then block reduces
-            if (dim_idx == 0) {
-                logits[t] = partial;
+            // Cross-warp reduction via shared memory
+            if (lane_id == 0) {
+                warp_partials[warp_id] = partial;
             }
+            __syncthreads();
+
+            // Thread 0 reduces all warp partials into final dot product
+            if (dim_idx == 0) {
+                float dot = 0.0f;
+                for (int w = 0; w < num_warps; w++) {
+                    dot += warp_partials[w];
+                }
+                logits[t] = dot;
+            }
+            __syncthreads();
         }
         __syncthreads();
 

@@ -61,18 +61,18 @@ mod inner {
     pub struct GpuLayerInput<'a> {
         /// Hidden states entering this layer, shape [num_tokens, hidden_size].
         pub hidden_states: &'a CudaSlice<f32>,
-        /// Position ids for RoPE, shape [num_tokens].
-        pub positions: &'a CudaSlice<u32>,
+        /// Position ids for RoPE, shape [num_tokens]. Kernels expect int*.
+        pub positions: &'a CudaSlice<i32>,
         /// KV cache key block for this layer, shape [num_blocks, num_kv_heads, head_dim, block_size].
         pub key_cache: &'a CudaSlice<f32>,
         /// KV cache value block for this layer, shape [num_blocks, num_kv_heads, head_dim, block_size].
         pub value_cache: &'a CudaSlice<f32>,
         /// Block table mapping sequence positions to cache blocks, shape [num_seqs, max_blocks_per_seq].
-        pub block_tables: &'a CudaSlice<u32>,
+        pub block_tables: &'a CudaSlice<i32>,
         /// Context length for each sequence, shape [num_seqs].
-        pub context_lens: &'a CudaSlice<u32>,
+        pub context_lens: &'a CudaSlice<i32>,
         /// Slot mapping for cache writes during prefill, shape [num_tokens].
-        pub slot_mapping: &'a CudaSlice<u32>,
+        pub slot_mapping: &'a CudaSlice<i32>,
         /// Number of tokens in the batch.
         pub num_tokens: usize,
         /// Number of sequences in the batch.
@@ -140,6 +140,10 @@ mod inner {
                 hidden,
             )?;
 
+            // Sync: RMSNorm kernel on default stream, cuBLAS may use different stream
+            self.device.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("post-rmsnorm sync: {e}")))?;
+
             // ---------------------------------------------------------------
             // 2. QKV projections via cuBLAS sgemm
             //    input [num_tokens, hidden] x weight^T [hidden, proj_dim]
@@ -167,6 +171,10 @@ mod inner {
                 head_dim,
             )?;
 
+            // Sync: RoPE kernel finished, cuBLAS/attention next
+            self.device.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("post-rope sync: {e}")))?;
+
             // ---------------------------------------------------------------
             // 4. KV cache write + Attention (prefill vs decode)
             // ---------------------------------------------------------------
@@ -181,6 +189,10 @@ mod inner {
             )?;
 
             info!(layer = cfg.layer_idx, "gpu_layer: cache_write done");
+
+            // Sync: cache_write kernel must finish before FA2 reads cache
+            self.device.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("post-cache-write sync: {e}")))?;
 
             let attn_out = if input.is_prefill {
                 // Prefill: read from paged cache (K/V already written above)
@@ -206,6 +218,10 @@ mod inner {
                     input.max_context_len, input.block_size,
                 )?
             };
+
+            // Sync: attention kernel must finish before cuBLAS O-projection
+            self.device.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("post-attention sync: {e}")))?;
 
             // ---------------------------------------------------------------
             // 5. Output projection
@@ -355,7 +371,7 @@ mod inner {
             device: &Arc<CudaDevice>,
             q: &CudaSlice<f32>,
             k: &CudaSlice<f32>,
-            positions: &CudaSlice<u32>,
+            positions: &CudaSlice<i32>,
             rope_cos: &CudaSlice<f32>,
             rope_sin: &CudaSlice<f32>,
             num_tokens: usize,
@@ -427,7 +443,7 @@ mod inner {
             v: &CudaSlice<f32>,
             key_cache: &CudaSlice<f32>,
             value_cache: &CudaSlice<f32>,
-            slot_mapping: &CudaSlice<u32>,
+            slot_mapping: &CudaSlice<i32>,
             num_tokens: usize,
             num_kv_heads: usize,
             head_dim: usize,
@@ -467,8 +483,8 @@ mod inner {
             q: &CudaSlice<f32>,
             key_cache: &CudaSlice<f32>,
             value_cache: &CudaSlice<f32>,
-            block_tables: &CudaSlice<u32>,
-            context_lens: &CudaSlice<u32>,
+            block_tables: &CudaSlice<i32>,
+            context_lens: &CudaSlice<i32>,
             num_tokens: usize,
             num_seqs: usize,
             num_heads: usize,
@@ -586,8 +602,8 @@ mod inner {
             q: &CudaSlice<f32>,
             key_cache: &CudaSlice<f32>,
             value_cache: &CudaSlice<f32>,
-            block_tables: &CudaSlice<u32>,
-            context_lens: &CudaSlice<u32>,
+            block_tables: &CudaSlice<i32>,
+            context_lens: &CudaSlice<i32>,
             num_tokens: usize,
             num_seqs: usize,
             num_heads: usize,
@@ -696,7 +712,7 @@ mod inner {
             // Grid covers all elements with ceil division.
             unsafe {
                 kernel
-                    .launch(cfg, (&mut output, gate, up, n as u32))
+                    .launch(cfg, (&mut output, gate, up, n as i32))
                     .map_err(|e| LLMError::GpuError(format!("fused_silu_mul launch failed: {e}")))?;
             }
 
@@ -733,7 +749,7 @@ mod inner {
                 Some(k) => {
                     // SAFETY: a, b, output all have exactly n elements.
                     unsafe {
-                        k.launch(cfg, (&mut output, a, b, n as u32))
+                        k.launch(cfg, (&mut output, a, b, n as i32))
                             .map_err(|e| LLMError::GpuError(format!("add_kernel launch failed: {e}")))?;
                     }
                 }
