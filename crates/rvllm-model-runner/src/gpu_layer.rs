@@ -62,6 +62,19 @@ mod inner {
         pub down_proj: &'a CudaSlice<f32>,
     }
 
+    /// FP16 weight references for a single transformer layer (f16 GEMM path).
+    pub struct GpuLayerWeightsF16<'a> {
+        pub q_proj: &'a CudaSlice<f32>,
+        pub k_proj: &'a CudaSlice<f32>,
+        pub v_proj: &'a CudaSlice<f32>,
+        pub o_proj: &'a CudaSlice<f32>,
+        pub input_layernorm: &'a CudaSlice<f32>,
+        pub post_attention_layernorm: &'a CudaSlice<f32>,
+        pub gate_proj: &'a CudaSlice<f32>,
+        pub up_proj: &'a CudaSlice<f32>,
+        pub down_proj: &'a CudaSlice<f32>,
+    }
+
     /// Metadata needed for a single layer forward pass.
     pub struct GpuLayerInput<'a> {
         /// Hidden states entering this layer, shape [num_tokens, hidden_size].
@@ -116,6 +129,29 @@ mod inner {
         /// Returns the output hidden states as a new CudaSlice<f32> of shape
         /// [num_tokens, hidden_size]. The caller is responsible for using this
         /// as input to the next layer.
+        /// FP16 forward pass -- currently delegates to f32 forward (f16 KV cache is handled inside).
+        pub fn forward_f16(
+            &self,
+            input: &GpuLayerInput<'_>,
+            _weights_f16: &GpuLayerWeightsF16<'_>,
+            blas: &CublasHandle,
+        ) -> Result<CudaSlice<f32>> {
+            // TODO: use hgemm with f16 weights. For now, reuse f32 weights via the standard path.
+            // The f16 KV cache write/read is already active in cache_write() and attention().
+            let weights = GpuLayerWeights {
+                q_proj: _weights_f16.q_proj,
+                k_proj: _weights_f16.k_proj,
+                v_proj: _weights_f16.v_proj,
+                o_proj: _weights_f16.o_proj,
+                input_layernorm: _weights_f16.input_layernorm,
+                post_attention_layernorm: _weights_f16.post_attention_layernorm,
+                gate_proj: _weights_f16.gate_proj,
+                up_proj: _weights_f16.up_proj,
+                down_proj: _weights_f16.down_proj,
+            };
+            self.forward(input, &weights, blas)
+        }
+
         pub fn forward(
             &self,
             input: &GpuLayerInput<'_>,
