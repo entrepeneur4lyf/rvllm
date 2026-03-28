@@ -20,9 +20,7 @@ mod inner {
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
-    use rvllm_sequence::{
-        Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus,
-    };
+    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::GpuWorker;
 
@@ -701,11 +699,7 @@ mod inner {
                     .collect();
                 for sid in dead_sids {
                     if let Some(blocks) = self.seq_block_tables.remove(&sid) {
-                        debug!(
-                            seq_id = sid.0,
-                            num_blocks = blocks.len(),
-                            "recycling blocks from finished sequence"
-                        );
+                        debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
                         for b in blocks {
                             self.free_blocks.push(b.0);
                         }
@@ -753,10 +747,7 @@ mod inner {
         fn build_metadata(
             &mut self,
             groups: &[SequenceGroup],
-        ) -> (
-            Vec<SequenceGroupMetadata>,
-            std::collections::HashSet<SequenceId>,
-        ) {
+        ) -> (Vec<SequenceGroupMetadata>, std::collections::HashSet<SequenceId>) {
             let block_size = self.config.cache.block_size;
             let mut metadata = Vec::with_capacity(groups.len());
             let mut aborted_seqs: std::collections::HashSet<SequenceId> =
@@ -809,8 +800,7 @@ mod inner {
                             }
                         }
                         // Mark finished so the scheduler drops it next round.
-                        self.scheduler
-                            .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                        self.scheduler.finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
                         aborted_seqs.insert(seq.seq_id);
                         continue;
                     }

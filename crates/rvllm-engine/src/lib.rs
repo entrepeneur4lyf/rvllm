@@ -24,7 +24,7 @@ pub mod engine;
 pub mod gpu_engine;
 pub mod gpu_metrics;
 #[cfg(any(feature = "cuda", test))]
-pub mod hf_snapshot;
+mod hf_snapshot;
 pub mod output;
 pub mod stop_checker;
 
