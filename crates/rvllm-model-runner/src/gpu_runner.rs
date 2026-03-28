@@ -445,7 +445,8 @@ mod cuda_impl {
             // block_tables: [num_seqs, graph_max_blocks], zero-padded.
             let block_tables_off = scratch.len();
             let bt_len = num_seqs * max_blocks;
-            scratch.resize(scratch.len() + bt_len, 0i32);
+            let new_len = scratch.len() + bt_len;
+            scratch.resize(new_len, 0i32);
             for (s, row) in attn_meta.block_tables.iter().enumerate() {
                 for (b, &blk) in row.iter().enumerate() {
                     scratch[block_tables_off + s * max_blocks + b] = blk as i32;
