@@ -37,15 +37,15 @@
 \arrayrulecolor{dkgray}
 
 \usepackage{listings}
-\lstset{basicstyle=\ttfamily\small\color{dkfg},keywordstyle=\color{dkcyan}\bfseries,commentstyle=\color{dkgreen},stringstyle=\color{dkorange},breaklines=true,frame=single,rulecolor=\color{dkgray},numbers=left,numberstyle=\tiny\color{dkgray},xleftmargin=2em,framexleftmargin=1.5em,columns=flexible,showstringspaces=false,backgroundcolor=\color{dkbot}}
+\lstset{basicstyle=\ttfamily\small\color{dkfg},keywordstyle=\bfseries\color{dkfg},commentstyle=\itshape\color{dkfg!70},stringstyle=\color{dkfg},breaklines=true,frame=single,rulecolor=\color{dkgray},numbers=left,numberstyle=\tiny\color{dkgray},xleftmargin=2em,framexleftmargin=1.5em,columns=flexible,showstringspaces=false,backgroundcolor=\color{dkbot}}
 
-\usepackage[colorlinks=true,linkcolor=dkcyan,citecolor=dkgreen,urlcolor=dkorange]{hyperref}
+\usepackage[colorlinks=false,pdfborder={0 0 0},urlbordercolor=dkfg]{hyperref}
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage{titlesec}
-\titleformat{\section}{\large\bfseries\color{dkcyan}}{\thesection}{1em}{}
-\titleformat{\subsection}{\normalsize\bfseries\color{dkcyan!70!dkfg}}{\thesubsection}{1em}{}
+\titleformat{\section}{\large\bfseries\color{dkfg}}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries\color{dkfg}}{\thesubsection}{1em}{}
 
-\newcommand{\thead}[1]{\textbf{\color{dkcyan}#1}}
+\newcommand{\thead}[1]{\textbf{#1}}
 
 \begin{document}
 \input{rvllm-body}
