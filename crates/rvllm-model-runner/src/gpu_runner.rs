@@ -14,7 +14,7 @@
 mod cuda_impl {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream};
+    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync};
     use tracing::{debug, info, trace};
 
     use crate::bridge::{LLMError, Result};
@@ -272,23 +272,37 @@ mod cuda_impl {
             let num_tokens = token_ids.len();
             let hidden_size = self.config.hidden_size;
 
-            // CPU gather fallback -- embed_gather.cu kernel can replace this later
-            let embed_host = self.device
-                .dtoh_sync_copy(&self.embed_tokens)
-                .map_err(|e| LLMError::GpuError(format!("embed DtoH: {e}")))?;
+            let kernel = self.device
+                .get_func("embedding_gather", "embedding_gather_kernel")
+                .ok_or_else(|| LLMError::GpuError("embedding_gather_kernel not loaded".into()))?;
 
-            let mut output = vec![0.0f32; num_tokens * hidden_size];
-            for (t, &tid) in token_ids.iter().enumerate() {
-                let src = tid as usize * hidden_size;
-                if src + hidden_size <= embed_host.len() {
-                    output[t * hidden_size..t * hidden_size + hidden_size]
-                        .copy_from_slice(&embed_host[src..src + hidden_size]);
-                }
+            let output = self.device
+                .alloc_zeros::<f32>(num_tokens * hidden_size)
+                .map_err(|e| LLMError::GpuError(format!("embed alloc: {e}")))?;
+
+            let ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
+            let ids_gpu = self.device
+                .htod_sync_copy(&ids_i32)
+                .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
+
+            let block_dim = hidden_size.min(1024) as u32;
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                kernel.launch(cfg, (
+                    &output,
+                    &self.embed_tokens,
+                    &ids_gpu,
+                    num_tokens as i32,
+                    hidden_size as i32,
+                )).map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
             }
 
-            self.device
-                .htod_sync_copy(&output)
-                .map_err(|e| LLMError::GpuError(format!("embed HtoD: {e}")))
+            Ok(output)
         }
 
         pub fn config(&self) -> &ModelRunnerConfig {
