@@ -4,7 +4,16 @@
 
 Long prompts (thousands of tokens) block the entire GPU for a single prefill step, starving decode requests of forward passes and spiking latency. Chunked prefill splits long prompts into fixed-size chunks and interleaves them with decode steps, keeping latency bounded while maintaining throughput.
 
-rvLLM's scheduler already has chunked prefill scaffolding (`max_prefill_chunk`, `num_prompt_tokens_processed`, `token_chunk_size`). The scheduler correctly computes chunk sizes and advances progress across steps. What's missing is the downstream wiring: the worker/model runner doesn't use `token_chunk_size` to build partial prefill inputs, and attention doesn't handle mixed prefill+decode batches correctly when a request is mid-prefill.
+rvLLM's **standalone** scheduler crate (`rvllm-scheduler`) has chunked prefill scaffolding (`max_prefill_chunk`, `num_prompt_tokens_processed`, `token_chunk_size`). It correctly computes chunk sizes and advances progress across steps. However, the CUDA inference path (`GpuLLMEngine`) uses its own inline `FifoScheduler` that has **none** of this functionality. What's missing is both the engine-level scheduling and the downstream wiring: the worker/model runner doesn't use `token_chunk_size` to build partial prefill inputs, and attention doesn't handle mixed prefill+decode batches correctly when a request is mid-prefill.
+
+### Architecture Note: Dual Scheduler Paths
+
+The codebase has TWO independent schedulers (same pattern as prefix caching in Spec 01):
+
+1. **`rvllm-scheduler::Scheduler`** — full-featured with chunked prefill, preemption, swap. Uses its own local `SequenceGroup` type with `num_prompt_tokens_processed`.
+2. **`GpuLLMEngine::FifoScheduler`** — simple inline FIFO (~50 lines in `gpu_engine.rs`). No chunked prefill, no preemption. Uses `rvllm_sequence::SequenceGroup` which does NOT have `num_prompt_tokens_processed`.
+
+The CUDA engine uses path (2). Implementation must either extend `FifoScheduler` with chunked prefill or wire the engine to use the standalone scheduler (which has API mismatches — see `crates/rvllm-engine/src/engine.rs` comment: "rvllm_scheduler uses a different SequenceGroup type").
 
 ## vLLM Reference Behavior
 
@@ -68,14 +77,28 @@ fn tokens_for_group(&self, group: &SequenceGroup) -> usize {
 
 ### What's Missing
 
-1. **Worker input preparation doesn't use `token_chunk_size`**: The worker always builds input for the full prompt or 1 decode token. It doesn't handle "tokens 512..1024 of a 4096-token prompt."
-2. **Positions are wrong for chunks**: A second chunk should have positions starting at `num_computed_tokens`, not 0.
-3. **Attention metadata for mid-prefill**: `seq_lens` should be `num_computed_tokens + chunk_size`, not just `chunk_size`. The KV cache already has the earlier chunks' data.
-4. **Slot mapping for chunks**: New tokens in a chunk need slots in the KV cache starting at position `num_computed_tokens`, not position 0.
-5. **Output suppression**: No mechanism to discard sampled tokens for incomplete prefills.
-6. **Mixed batch splitting**: Attention backend doesn't split decode vs prefill tokens within a single batch.
+1. **`GpuLLMEngine`'s `FifoScheduler` has no chunked prefill**: No `max_prefill_chunk`, no `num_prompt_tokens_processed` tracking, no `token_chunk_size`. This is the prerequisite for all other work.
+2. **Worker input preparation doesn't use `token_chunk_size`**: The worker always builds input for the full prompt or 1 decode token. It doesn't handle "tokens 512..1024 of a 4096-token prompt."
+3. **Positions are wrong for chunks**: A second chunk should have positions starting at `num_computed_tokens`, not 0.
+4. **Attention metadata for mid-prefill**: `seq_lens` should be `num_computed_tokens + chunk_size`, not just `chunk_size`. The KV cache already has the earlier chunks' data.
+5. **Slot mapping for chunks**: New tokens in a chunk need slots in the KV cache starting at position `num_computed_tokens`, not position 0.
+6. **Output suppression**: No mechanism to discard sampled tokens for incomplete prefills.
+7. **Mixed batch attention kernel path**: The FlashAttention CUDA implementation uses `is_decode = (num_tokens == num_seqs)` to choose kernel paths. In a mixed batch with chunked prefill, this heuristic fails — some sequences have `query_len > 1` (prefill chunk) while others have `query_len = 1` (decode).
+8. **`SequenceGroupMetadata` lacks chunk fields**: The struct in `crates/rvllm-sequence/src/metadata.rs` needs `num_computed_tokens` and `token_chunk_size` fields.
+
+**Partial existing infrastructure**: `crates/rvllm-worker/src/input.rs` already has `prepare_prefill_refs()` / `prepare_decode_refs()` / `merge_inputs()` for splitting mixed batches by the `is_prompt` flag. This handles the basic split but not partially-prefilled sequences. Also, `seq_start_pos` is already computed in `crates/rvllm-model-runner/src/gpu_runner.rs` from `query_lens` and uploaded to GPU.
 
 ## Implementation Plan
+
+### Phase 0: Engine Scheduler Integration
+
+**Files**: `crates/rvllm-engine/src/gpu_engine.rs`
+
+Before any downstream work, `GpuLLMEngine`'s `FifoScheduler` needs chunked prefill support. Either:
+- **Option A**: Extend `FifoScheduler` inline — add `max_prefill_chunk`, track `num_prompt_tokens_processed` per sequence, compute `token_chunk_size` when scheduling.
+- **Option B**: Wire the engine to use `rvllm-scheduler::Scheduler` — requires resolving the `SequenceGroup` type mismatch between `rvllm_sequence::SequenceGroup` and the scheduler's local type.
+
+Recommendation: Option A is simpler and lower-risk. The standalone scheduler can serve as a reference implementation.
 
 ### Phase 1: Worker Input Preparation for Chunks
 
@@ -92,18 +115,22 @@ The engine must pass `num_computed_tokens` and `token_chunk_size` through `Seque
 
 ### Phase 2: Attention Metadata for Partial Prefills
 
-**Files**: `crates/rvllm-attention/src/metadata.rs`, `crates/rvllm-worker/src/input.rs`
+**Files**: `crates/rvllm-model-runner/src/bridge.rs`, `crates/rvllm-worker/src/input.rs`, `crates/rvllm-model-runner/src/gpu_runner.rs`
 
-`AttentionMetadata` needs to distinguish `query_lens` from `seq_lens`:
+**Note on `AttentionMetadata`**: There are two `AttentionMetadata` structs. The one used by the worker/runner is in `crates/rvllm-model-runner/src/bridge.rs` (uses `Vec<u32>`, already has `query_lens`). The one in `crates/rvllm-attention/src/metadata.rs` uses `GpuBuffer<i32>` and is the GPU-side representation. Changes must flow through both.
+
+The bridge `AttentionMetadata` already has `query_lens: Vec<u32>`. It needs proper population for chunked prefill:
 
 ```rust
+// In bridge.rs AttentionMetadata (already exists, needs correct population):
 pub struct AttentionMetadata {
-    pub query_lens: Vec<usize>,    // tokens being computed THIS step (chunk_size for prefill, 1 for decode)
-    pub seq_lens: Vec<usize>,      // total context length (num_computed + chunk_size)
-    pub seq_start_pos: Vec<usize>, // prefix sum of query_lens (for FlashAttention)
+    pub query_lens: Vec<u32>,      // tokens being computed THIS step (chunk_size for prefill, 1 for decode)
+    pub seq_lens: Vec<u32>,        // total context length (num_computed + chunk_size)
     // ... existing fields
 }
 ```
+
+`seq_start_pos` is already computed in `crates/rvllm-model-runner/src/gpu_runner.rs` from `query_lens` and uploaded to GPU as part of the packed metadata buffer.
 
 For a mixed batch with 3 decode requests and 1 chunked prefill (chunk_size=256, total context=768):
 - `query_lens = [1, 1, 1, 256]`
@@ -131,7 +158,9 @@ for output in &worker_outputs {
 
 ### Phase 4: Block Allocation for Chunks
 
-**Files**: `crates/rvllm-block-manager/src/manager.rs`, `crates/rvllm-engine/src/gpu_engine.rs`
+**Files**: `crates/rvllm-engine/src/gpu_engine.rs`
+
+**Note**: The CUDA engine uses its own inline block allocator (`self.seq_block_tables`, `self.free_blocks`, `self.next_block_id`), NOT `BlockManager` from `rvllm-block-manager`. Changes must target `GpuLLMEngine::build_metadata()`. The standalone `BlockManager` can be updated separately for the non-CUDA path.
 
 Blocks must be allocated incrementally:
 - On the first chunk, allocate blocks for `ceil(chunk_size / block_size)` blocks.
@@ -153,12 +182,14 @@ The engine tracks the block table per sequence and extends it as chunks are proc
 
 | File | Change |
 |------|--------|
+| `crates/rvllm-engine/src/gpu_engine.rs` | Add chunked prefill to `FifoScheduler`, pass chunk metadata, suppress partial prefill outputs, incremental block allocation |
+| `crates/rvllm-sequence/src/metadata.rs` | Add `num_computed_tokens` and `token_chunk_size` to `SequenceGroupMetadata` |
 | `crates/rvllm-worker/src/input.rs` | Handle `num_computed_tokens` and `token_chunk_size` in input preparation |
-| `crates/rvllm-attention/src/metadata.rs` | Ensure `query_lens` vs `seq_lens` distinction |
-| `crates/rvllm-engine/src/gpu_engine.rs` | Pass chunk metadata to worker, suppress partial prefill outputs |
+| `crates/rvllm-model-runner/src/bridge.rs` | Ensure `AttentionMetadata` fields populated correctly for chunks |
+| `crates/rvllm-model-runner/src/gpu_runner.rs` | Update `seq_start_pos` and metadata upload for mixed batches |
 | `crates/rvllm-engine/src/output.rs` | Filter outputs for incomplete prefills |
-| `crates/rvllm-block-manager/src/manager.rs` | Incremental block allocation across chunks |
 | `crates/rvllm-sequence/src/sequence.rs` | Ensure `num_computed_tokens` is advanced per chunk |
+| `crates/rvllm-attention/src/flash_attention_impl.rs` | Fix `is_decode` heuristic for mixed batches |
 
 ## Dependencies
 

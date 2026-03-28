@@ -42,17 +42,28 @@ Freed blocks go onto an LRU free list (doubly-linked list for O(1) operations). 
 ### What Exists
 
 - `PrefixCache` in `crates/rvllm-block-manager/src/prefix_cache.rs` with `lookup()`, `insert()`, `release()`, `evict_one()`
-- `BlockManager` integration: `allocate()` checks prefix cache, `register_prefix()` caches blocks after prefill
-- Config flag: `CacheConfig.enable_prefix_caching` in `crates/rvllm-config/src/cache.rs`
+- `BlockManager` integration: `allocate()` checks prefix cache, `register_prefix()` caches blocks after prefill. Note: `BlockManager` correctly passes actual block IDs from the sequence's block table in `register_prefix()`.
+- Config flag: `CacheConfigImpl.enable_prefix_caching` in `crates/rvllm-config/src/cache.rs` (the struct is `CacheConfigImpl`, not `CacheConfig`)
 - Engine creates `PrefixCache` if enabled, calls `count_hits()` during step
+
+### Architecture Note: Dual Block Management Paths
+
+**This is critical for implementers.** The codebase has TWO independent block management systems:
+
+1. **`BlockManager`** in `rvllm-block-manager/src/manager.rs` — full-featured with prefix cache integration, CoW, swap-in/swap-out. Used by `rvllm-scheduler/src/scheduler.rs`.
+2. **Inline allocator** in `GpuLLMEngine::build_metadata()` at `gpu_engine.rs:810-890` — simple allocator using `self.seq_block_tables`, `self.free_blocks`, `self.next_block_id`. Used by the CUDA inference path.
+
+The CUDA engine path (`GpuLLMEngine`) uses path (2) exclusively. It also has its own inline `FifoScheduler` (defined in `gpu_engine.rs`, ~50 lines) that does NOT use `rvllm-scheduler`. Changes to `BlockManager` or `rvllm-scheduler::Scheduler` have **no effect** on the CUDA inference path.
+
+**All implementation work must target `GpuLLMEngine` and its inline allocator/scheduler.** Changes to `BlockManager` are useful for correctness but won't be exercised until the engine is refactored to use it.
 
 ### What's Broken
 
-1. **Wrong hash algorithm**: Hashes `tokens[0..(block_idx+1)*block_size]` (entire prefix, grows linearly) instead of chain-hashing each block independently. O(n^2) for long sequences.
-2. **Cache hits are decoration**: `count_hits()` is logged but never used to skip computation. The model runner always recomputes the full prefill.
-3. **Wrong block IDs on registration**: Engine calls `register_prefix_blocks()` with placeholder `BlockId(i as u32)` instead of the actual allocated block IDs from the block table.
-4. **O(n) eviction**: Scans `HashMap` for minimum `last_access` instead of O(1) LRU list.
-5. **No scheduler integration**: The scheduler has zero awareness of prefix caching.
+1. **Wrong hash algorithm**: `hash_prefix()` hashes `tokens[0..(block_idx+1)*block_size]` (entire prefix up to each block boundary). For block 0 it hashes `bs` tokens, for block 1 it hashes `2*bs`, etc. Computing all N block hashes costs `bs + 2*bs + ... + N*bs = O(N^2 * bs)`. Should chain-hash each block independently in O(block_size) per block.
+2. **Cache hits are decoration**: `count_hits()` result at `gpu_engine.rs:621` is only logged via `debug!()` and never used to set `num_computed_tokens` or skip computation. The model runner always recomputes the full prefill.
+3. **Wrong block IDs on registration (engine path only)**: `GpuLLMEngine` at `gpu_engine.rs:543-545` builds placeholder `BlockId(i as u32)` sequential IDs instead of using `self.seq_block_tables`. Note: `BlockManager.register_prefix()` correctly passes actual block IDs — this bug is only in the engine's inline path.
+4. **O(n) eviction**: `evict_one()` at `prefix_cache.rs:134` scans `self.cache.iter().filter(...).min_by_key(...)` — O(n) scan of the HashMap instead of O(1) LRU list.
+5. **No scheduler integration**: Neither the `FifoScheduler` in `gpu_engine.rs` nor `rvllm-scheduler::Scheduler` has prefix cache awareness.
 
 ## Implementation Plan
 
@@ -120,20 +131,35 @@ Operations:
 ### Phase 3: Wire Cache Hits to Skip Computation
 
 **Files**:
-- `crates/rvllm-scheduler/src/scheduler.rs` -- add prefix cache awareness
-- `crates/rvllm-sequence/src/sequence.rs` -- add `num_computed_tokens` field
-- `crates/rvllm-engine/src/gpu_engine.rs` -- pass correct block IDs, use computed token count
+- `crates/rvllm-engine/src/gpu_engine.rs` -- modify `FifoScheduler` and `build_metadata()` for prefix cache awareness
+- `crates/rvllm-sequence/src/sequence.rs` -- `num_computed_tokens` field already exists (initialized to 0)
+- `crates/rvllm-sequence/src/metadata.rs` -- add `num_computed_tokens` to `SequenceGroupMetadata`
 - `crates/rvllm-worker/src/input.rs` -- adjust input preparation for partial prefill
 
 This is the critical integration:
 
-1. **Scheduler**: Before scheduling a new request, call `prefix_cache.lookup(block_hashes)` to get the number of cached blocks. Set `sequence.num_computed_tokens = cached_blocks * block_size`.
+1. **Engine scheduler**: In `GpuLLMEngine`'s `FifoScheduler`, before scheduling a new request, call `prefix_cache.lookup(block_hashes)` to get the number of cached blocks. Set `sequence.num_computed_tokens = cached_blocks * block_size`.
 
-2. **Engine**: When building `SequenceGroupMetadata` for the worker, include `num_computed_tokens`. Pass the actual block IDs from `seq_block_tables` (not placeholders) when registering prefix blocks.
+2. **SequenceGroupMetadata**: Add `num_computed_tokens: usize` to `SequenceGroupMetadata` in `crates/rvllm-sequence/src/metadata.rs`. This struct currently has `{ request_id, is_prompt, seq_data, sampling_params, block_tables }` — the new field is how the engine communicates cache hits to the worker.
 
-3. **Worker input preparation**: When `num_computed_tokens > 0`, the prefill input should only include tokens from `num_computed_tokens` onwards. Positions start at `num_computed_tokens`. The block table includes the cached blocks (already allocated) plus new blocks for remaining tokens.
+3. **Engine block allocation**: In `GpuLLMEngine::build_metadata()`, the inline block allocator must "adopt" cached blocks: add them to `self.seq_block_tables` for the sequence, increment ref count, and only allocate new physical blocks for the remaining (uncached) tokens. Pass the actual block IDs from `self.seq_block_tables` (not placeholders) when registering prefix blocks.
 
-4. **Block allocation**: `BlockManager::allocate()` should "adopt" cached blocks (increment ref count, add to the sequence's block table) rather than allocating new physical blocks for the cached portion.
+4. **Worker input preparation**: When `num_computed_tokens > 0`, `prepare_prefill()` in `input.rs` must change:
+   - **Tokens**: Send only `prompt_token_ids[num_computed_tokens..]` (skip cached tokens)
+   - **Positions**: Start at `num_computed_tokens`, not 0 — i.e., `num_computed_tokens..seq_len`
+   - **Slot mapping**: Only generate mappings for the new tokens (`num_computed_tokens` onward)
+   - **Block table**: Include ALL blocks (cached + new) since the attention kernel needs the full KV cache for attending to the cached prefix
+   - Currently `prepare_prefill()` always sends all `prompt_token_ids` with positions `0..seq_len`, so this is a significant change
+
+5. **Standalone scheduler** (optional, lower priority): `rvllm-scheduler/src/scheduler.rs` could also gain prefix cache awareness. This is separate from the CUDA engine path and can be done independently.
+
+### Concurrency Note
+
+`GpuLLMEngine` is marked `unsafe impl Send`. If the engine is ever shared across threads (e.g., via the async API server), the `PrefixCache` needs locking. The `SharedBlockManager` wraps `BlockManager` in a `Mutex`, but `GpuLLMEngine` has no similar wrapper for `PrefixCache`. Consider wrapping in `Mutex` from the start.
+
+### Interaction with Chunked Prefill
+
+If prefix caching is combined with chunked prefill (Spec 02), `num_computed_tokens` from the prefix cache interacts with `num_prompt_tokens_processed` from the chunking system. The semantics: `num_computed_tokens` (from cache) sets the starting point, and chunked prefill processes the remaining tokens in chunks. Ensure these don't double-count.
 
 ### Phase 4: Correct Block Registration
 
@@ -166,13 +192,13 @@ if let Some(ref mut pc) = self.prefix_cache {
 | File | Change |
 |------|--------|
 | `crates/rvllm-block-manager/src/prefix_cache.rs` | Rewrite hash algorithm, add LRU list, fix lookup/insert |
-| `crates/rvllm-block-manager/src/manager.rs` | Update allocate() to adopt cached blocks |
-| `crates/rvllm-scheduler/src/scheduler.rs` | Add prefix cache lookup before scheduling |
-| `crates/rvllm-sequence/src/sequence.rs` | Ensure `num_computed_tokens` is set from cache hits |
-| `crates/rvllm-engine/src/gpu_engine.rs` | Fix block ID registration, wire cache hit count |
-| `crates/rvllm-worker/src/input.rs` | Adjust input prep for partial prefill (skip computed tokens) |
+| `crates/rvllm-engine/src/gpu_engine.rs` | Fix block ID registration, wire cache hit count, add prefix cache awareness to `FifoScheduler` and `build_metadata()` |
+| `crates/rvllm-sequence/src/metadata.rs` | Add `num_computed_tokens` to `SequenceGroupMetadata` |
+| `crates/rvllm-worker/src/input.rs` | Adjust input prep for partial prefill (skip computed tokens, offset positions) |
+| `crates/rvllm-block-manager/src/manager.rs` | Update allocate() to adopt cached blocks (for standalone scheduler path) |
+| `crates/rvllm-scheduler/src/scheduler.rs` | Add prefix cache lookup (for standalone scheduler path, lower priority) |
 
 ## Open Questions
 
 - Should we support extra hash keys (LoRA adapter name, multimodal inputs) from the start, or add them later? Recommendation: add an `extra_keys: Option<&[u8]>` parameter to `hash_block()` now but don't use it yet.
-- Should the prefix cache be per-engine or shared across engines (for tensor parallelism)? vLLM keeps it per-scheduler. Recommendation: per-engine for now.
+- The prefix cache is already per-engine (GpuLLMEngine has its own `prefix_cache` field). This is consistent with vLLM's per-scheduler design.

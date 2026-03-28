@@ -57,21 +57,22 @@ vLLM's rejection sampler (`vllm/v1/spec_decode/rejection_sampler.py`):
 
 1. **`config.rs`**: `SpeculativeConfig` with `draft_model_path`, `num_speculative_tokens` (default 3), `acceptance_threshold`, `enabled` flag.
 
-2. **`verification.rs`**: `verify_tokens()` -- correct implementation of modified rejection sampling. Takes draft tokens + draft logprobs + target logprobs, returns `VerificationResult` with `accepted_tokens`, `bonus_token`, `accepted_count`. Well-tested with 7 unit tests covering greedy acceptance, partial rejection, full rejection, bonus tokens, and temperature scaling.
+2. **`verification.rs`**: `verify_tokens()` -- correct implementation of modified rejection sampling. Takes draft tokens + draft logprobs + target logprobs, returns `VerificationResult` with `accepted_tokens`, `bonus_token`, `num_accepted`. Well-tested with 6 unit tests: `self_speculation_accepts_all`, `zero_target_rejects_all`, `partial_acceptance`, `bonus_token_on_full_accept`, `probabilistic_acceptance_rate`, `empty_input`.
 
-3. **`draft.rs`**: `DraftModelRunner` -- stub that always returns `(vec![0; num_tokens], vec![0.0; num_tokens * vocab_size])`. No actual model inference. The interface is correct: `fn generate_draft(&self, context: &[TokenId], num_tokens: usize) -> Result<(Vec<TokenId>, Vec<f32>)>`.
+3. **`draft.rs`**: `DraftModelRunner` -- placeholder with no actual model inference. The interface is `fn generate_draft_tokens(&self, input_tokens: &[TokenId], num_tokens: usize) -> Result<Vec<DraftToken>>` where `DraftToken` has `token_id`, `logprob`, and `draft_probs: Vec<f32>`. The stub uses a deterministic formula based on the last context token: `selected = ((last as usize + i + 1) % self.vocab_size)` with prob 1.0 on the selected token.
 
 4. **`engine.rs`**: `SpeculativeEngine` -- wraps an async engine with a propose-verify loop. Has metrics tracking (total_draft_tokens, accepted, bonus, steps). The loop structure is correct but calls the stub draft runner.
 
-5. **`scheduler.rs`**: `SpeculativeScheduler` -- wraps the base scheduler, reserves extra slots for draft tokens via `reserve_draft_slots()`. Basic but structurally correct.
+5. **`scheduler.rs`**: `SpeculativeScheduler` -- a standalone coordinator (not a wrapper around the base scheduler). Has `prepare_draft_and_target()` which runs the draft model and builds combined input for the target model. Does NOT have `reserve_draft_slots()`.
 
 ### What's Missing
 
-1. **No working proposer**: `DraftModelRunner::generate_draft()` is a stub.
-2. **No integration with main engine**: `SpeculativeEngine` is standalone, not wired into `GpuLLMEngine` or `AsyncGpuLLMEngine`.
+1. **No working proposer**: `DraftModelRunner::generate_draft_tokens()` is a placeholder returning deterministic tokens.
+2. **No integration with main engine**: `SpeculativeEngine` is standalone, not wired into `GpuLLMEngine` or `AsyncGpuLLMEngine`. Zero references to speculative in `rvllm-engine/` or `rvllm-config/`.
 3. **No KV cache management for drafts**: Draft tokens need KV cache slots allocated, and rejected tokens need their slots freed.
 4. **No n-gram proposer**: The simplest proposer type doesn't exist.
 5. **Target model forward pass doesn't handle K+1 positions**: The worker needs to forward K+1 tokens per sequence (1 original + K draft) and return logits for all positions.
+6. **No config wiring**: `rvllm-config` has zero references to speculative decoding. `EngineConfig` would need a new optional `SpeculativeConfig` field.
 
 ## Implementation Plan
 
@@ -118,31 +119,39 @@ The n-gram proposer doesn't need draft logprobs for greedy verification (compare
 ### Phase 2: Wire Speculative Engine into Main Engine
 
 **Files**:
-- `crates/rvllm-engine/src/gpu_engine.rs` or `crates/rvllm-engine/src/async_gpu_engine.rs`
+- `crates/rvllm-engine/src/gpu_engine.rs` (gated behind `#[cfg(feature = "cuda")]`)
 - `crates/rvllm-speculative/src/engine.rs`
+- `crates/rvllm-config/src/lib.rs` (add `SpeculativeConfig` to `EngineConfig`)
+
+**Note**: `GpuLLMEngine` has tightly-coupled private methods (`step()` → `prepare_step()` → `build_metadata()` → `worker.execute()` → `process_worker_outputs()`). Integrating speculative decoding requires restructuring this pipeline to support K+1 token forward passes per sequence — this is significant effort.
+
+The existing `SpeculativeScheduler.prepare_draft_and_target()` already does half of this work (running draft model and building combined input). Reference it during integration.
 
 The speculative engine wraps the target engine. Each step becomes:
 
-1. For each running decode sequence, call `ngram_proposer.propose(token_history)` to get K draft tokens.
+1. For each running decode sequence, call `ngram_proposer.propose(token_history)` to get K draft tokens. **If no n-gram match is found, fall back to normal single-token decode** — this decision point directly affects engine integration complexity.
 2. Build a forward pass input with K+1 tokens per speculating sequence: the last accepted token + K draft tokens.
 3. Call the target model forward to get logits for all K+1 positions.
 4. Run `verify_tokens()` on each sequence using target logits.
 5. Append accepted tokens + bonus token to the sequence.
-6. Update `num_computed_tokens` by `accepted_count + 1`.
+6. Update `num_computed_tokens` by `num_accepted + 1`.
 
-For sequences where no n-gram match is found, fall back to normal single-token decode.
+**Bonus token subtlety**: When all K drafts are accepted, the verification code uses `target_probs[k-1]` for the bonus token. The code comment says "In practice the engine provides K+1 target distributions." Ensure the target forward pass returns K+1 distributions (not just K) so the bonus token is sampled from the correct position.
 
 ### Phase 3: KV Cache Management for Draft Tokens
 
 **Files**:
-- `crates/rvllm-block-manager/src/manager.rs`
+- `crates/rvllm-engine/src/gpu_engine.rs` (inline block allocator)
+- `crates/rvllm-block-manager/src/manager.rs` (standalone path)
 - `crates/rvllm-speculative/src/scheduler.rs`
+
+**Note**: The CUDA engine uses its own inline block allocator (`self.seq_block_tables`, `self.free_blocks`), NOT `BlockManager`. Changes must target both paths. The `BlockManager` already has `allocate()`, `free()`, `can_allocate()`, CoW via `cow_if_needed()`, and swap-in/swap-out — the CoW mechanism could be relevant for draft token branch management.
 
 Draft tokens need KV cache slots. The approach:
 
-1. Before speculative forward, allocate K extra slots per speculating sequence (via block manager).
+1. Before speculative forward, allocate K extra slots per speculating sequence.
 2. After verification, free slots for rejected draft tokens. If the sequence accepted 2 of 5 draft tokens, free 3 slots.
-3. The block manager needs a `free_partial(seq_id, num_slots_to_free_from_end)` operation.
+3. Both the engine's inline allocator and `BlockManager` need a `free_partial(seq_id, num_slots_to_free_from_end)` operation.
 
 ### Phase 4: Draft Model Proposer (Future)
 

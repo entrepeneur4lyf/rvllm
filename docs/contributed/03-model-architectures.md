@@ -2,9 +2,9 @@
 
 ## Summary
 
-rvLLM supports 10 model families. vLLM supports ~260. This spec identifies the highest-priority models to add based on popularity and implementation complexity, and provides per-model architectural analysis against the existing rvLLM layer library.
+rvLLM supports 10 causal LM architectures plus embedding models (~12 registered architecture strings total). vLLM supports ~260. This spec identifies the highest-priority models to add based on popularity and implementation complexity, and provides per-model architectural analysis against the existing rvLLM layer library.
 
-rvLLM's architecture pattern is well-established: implement the `Architecture` trait, register the HuggingFace architecture string in `create_model()`, and reuse shared layers (RMSNorm, LinearLayer, RotaryEmbedding, MoELayer, etc.).
+rvLLM's architecture pattern is well-established: implement the `Architecture` trait (`pub trait Architecture: Send + Sync` with a single `forward()` method returning `Result<GpuBuffer<f32>>`), register the HuggingFace architecture string in `create_model()`, and reuse shared layers (RMSNorm, LinearLayer, RotaryEmbedding, MoELayer, etc.).
 
 ## Existing rvLLM Models
 
@@ -12,14 +12,19 @@ rvLLM's architecture pattern is well-established: implement the `Architecture` t
 |---|---|---|
 | `LlamaForCausalLM` | `llama.rs` | Reference implementation |
 | `MistralForCausalLM` | `mistral.rs` | Llama variant with sliding window |
-| `Qwen2ForCausalLM` | `qwen2.rs` | Llama variant with QKV bias |
+| `Qwen2ForCausalLM` | `qwen2.rs` | Llama variant with optional QKV bias |
 | `GemmaForCausalLM` | `gemma.rs` | +1 norm offset, GeGLU, embedding scaling |
-| `Gemma2ForCausalLM` | `gemma.rs` | Gemma + logit softcap + sliding window alternation |
-| `PhiForCausalLM` / `Phi3ForCausalLM` | `phi.rs` | Parallel attn+MLP (Phi2), sequential (Phi3) |
+| `Gemma2ForCausalLM` | `gemma.rs` | Gemma + logit softcap + sliding window alternation (even layers) |
+| `PhiForCausalLM` / `Phi3ForCausalLM` / `Phi3SmallForCausalLM` | `phi.rs` | Parallel attn+MLP (Phi2), sequential (Phi3) with QK LayerNorm |
 | `MixtralForCausalLM` | `mixtral.rs` | Sparse MoE |
-| `DeepSeekV2ForCausalLM` | `deepseek.rs` | MLA + MoE + shared expert |
-| `CohereForCausalLM` | `cohere.rs` | LayerNorm, different head structure |
-| `GPTNeoXForCausalLM` | `gpt_neox.rs` | Parallel attn+MLP, LayerNorm |
+| `DeepSeekV2ForCausalLM` / `DeepseekV2ForCausalLM` | `deepseek.rs` | MLA + MoE + shared expert |
+| `CohereForCausalLM` | `cohere.rs` | LayerNorm, MQA, per-head QK normalization, parallel attn+MLP |
+| `GPTNeoXForCausalLM` / `StableLmForCausalLM` | `gpt_neox.rs` | Parallel attn+MLP, LayerNorm, GELU |
+| `BertModel`, `RobertaModel`, etc. (8 strings) | `embedding.rs` | Embedding models (non-causal) |
+
+### Config Mechanism Note
+
+`ModelRunnerConfig` has generic fields (`num_layers`, `hidden_size`, `num_heads`, `num_kv_heads`, `head_dim`, `intermediate_size`, `vocab_size`, `max_position`, `rope_theta`, `dtype`, `architecture`). Model-specific config values (e.g., MoE expert count, QK-Norm flags) are not in the struct. Models like DeepSeek work around this by hardcoding defaults in `new()`. New models will either need config extension or per-architecture config parsing from the HuggingFace `config.json`.
 
 ## Priority Models to Add
 
@@ -42,18 +47,17 @@ rvLLM's architecture pattern is well-established: implement the `Architecture` t
 
 **Implementation**:
 1. Copy `qwen2.rs` to `qwen3.rs`
-2. Add QK-Norm: after Q/K projection, before RoPE:
+2. Add two weight buffers per layer: `q_norm_weight: GpuBuffer<f16>` and `k_norm_weight: GpuBuffer<f16>` (shape: `[head_dim]`)
+3. Add QK-Norm: after Q/K projection, before RoPE. Note: the existing `RMSNorm::forward()` takes `(&GpuBuffer, &GpuBuffer, f32)` and returns a new `Result<GpuBuffer<f16>>`. Per-head QK-Norm requires a new helper (see "New Shared Components" below) since the existing `RMSNorm` operates on the full hidden dimension, not per-head:
    ```rust
    // q shape: [num_tokens * num_heads * head_dim]
    // Apply RMSNorm per head (treat as [num_tokens * num_heads, head_dim])
-   for head_idx in 0..(num_tokens * num_heads) {
-       let start = head_idx * head_dim;
-       let end = start + head_dim;
-       rms_norm_inplace(&mut q[start..end], &qk_norm_weight, eps);
-   }
+   // This needs a new qk_norm_forward() helper or a CUDA kernel for efficiency
+   q = qk_norm_forward(&q, &q_norm_weight, head_dim, eps)?;
+   k = qk_norm_forward(&k, &k_norm_weight, head_dim, eps)?;
    ```
-3. Load `q_norm.weight` and `k_norm.weight` from safetensors (per-layer)
-4. Register `"Qwen3ForCausalLM"` in `mod.rs`
+4. Load `q_norm.weight` and `k_norm.weight` from safetensors (per-layer)
+5. Register `"Qwen3ForCausalLM"` in `mod.rs`
 
 **vLLM reference**: `vllm/model_executor/models/qwen3.py` -- inherits Qwen2, only replaces attention module to add QK-Norm.
 
@@ -78,17 +82,18 @@ rvLLM's architecture pattern is well-established: implement the `Architecture` t
 | Sliding window | Alternating layers | Configured via `layer_types` array from config |
 
 **New requirements**:
-1. **QK-Norm with Gemma's +1 offset**: Same as Qwen3 QK-Norm but using `(1 + weight) * normalized_x` instead of `weight * normalized_x`.
-2. **Per-layer RoPE theta**: Local (sliding window) layers use `rope_local_base_freq`, global layers use `rope_theta`. Requires either two `RotaryEmbedding` instances or a per-layer theta parameter.
-3. **Read `layer_types` from config**: Replace even/odd heuristic with the actual config array.
+1. **QK-Norm with Gemma's +1 offset**: Same as Qwen3 QK-Norm but using `(1 + weight) * normalized_x` instead of `weight * normalized_x`. Note: `GemmaRMSNorm` is currently a **private** struct inside `gemma.rs`. It needs to be made `pub` or extracted to `layers/norm.rs` for reuse by Gemma3.
+2. **Per-layer RoPE theta**: Local (sliding window) layers use `rope_local_base_freq`, global layers use `rope_theta`. Use `RotaryEmbedding::new(head_dim, max_seq_len, base)` (the instance method, which caches cos/sin tables) — NOT the static `forward()` which hardcodes `base: 10000.0`. Create two persistent instances with different `base` values.
+3. **Read `layer_types` from config**: Replace even/odd heuristic with the actual config array. Requires parsing `layer_types` and `rope_local_base_freq` from the HuggingFace `config.json` (not currently in `ModelRunnerConfig`).
 
 **Implementation**:
 1. Copy `gemma.rs` Gemma2 implementation to a new `Gemma3ForCausalLM`
-2. Remove attention logit softcapping
-3. Add QK-Norm with Gemma's +1 offset variant
-4. Create two `RotaryEmbedding` instances (local + global), select per layer based on `layer_types`
-5. Read `layer_types` and `rope_local_base_freq` from model config JSON
-6. Register `"Gemma3ForCausalLM"` in `mod.rs`
+2. Remove attention logit softcapping (`attn_logit_softcap`)
+3. Extract `GemmaRMSNorm` to `layers/norm.rs` (or make it `pub`) for QK-Norm reuse
+4. Add QK-Norm with Gemma's +1 offset variant per head
+5. Create two `RotaryEmbedding::new()` instances (local + global) with different `base` params, select per layer based on `layer_types`
+6. Parse `layer_types`, `rope_local_base_freq`, `tie_word_embeddings` from model config JSON
+7. Register `"Gemma3ForCausalLM"` in `mod.rs`
 
 **vLLM reference**: `vllm/model_executor/models/gemma3.py`
 
@@ -144,6 +149,8 @@ rvLLM's architecture pattern is well-established: implement the `Architecture` t
 
 **Warning**: This is the most complex model. The chunked local attention and attention temperature tuning have no precedent in the existing rvLLM codebase. Consider implementing after Qwen3 and Gemma3 are solid.
 
+**Note**: `rvllm-attention/src/sliding_window.rs` has `SlidingWindowConfig` with `layer_mask: Option<Vec<bool>>` for per-layer behavior, which could serve as a reference for the chunked local attention implementation.
+
 ---
 
 ## Existing Layer Library Reuse
@@ -160,9 +167,11 @@ rvLLM's architecture pattern is well-established: implement the `Architecture` t
 
 ## New Shared Components Needed
 
-1. **QK-Norm helper** (used by Qwen3, Gemma3, Llama4): Per-head RMSNorm on Q and K tensors. Should be a shared utility in `layers/norm.rs` since 3 models need it.
-2. **Configurable MoE routing** (used by Llama4): Add `RoutingMode::Sigmoid` to `MoELayer`.
-3. **Chunked local attention** (used by Llama4): New attention mask builder in `rvllm-attention`.
+1. **QK-Norm helper** (used by Qwen3, Gemma3, Llama4): Per-head RMSNorm on Q and K tensors. Should be a shared utility in `layers/norm.rs` since 3 models need it. Requires extracting `GemmaRMSNorm` (currently private in `gemma.rs`) for the +1 offset variant, and adding a standard variant for Qwen3/Llama4. The helper should operate on `[num_tokens * num_heads, head_dim]` shaped tensors.
+2. **Configurable MoE routing** (used by Llama4): Add `RoutingMode::Sigmoid` to `MoELayer`. Note: the existing `MoELayer.renormalize: bool` field is dead code (softmax on top-k already normalizes to sum=1). Clarify renormalization semantics when adding sigmoid mode, where sum ≠ 1 by default.
+3. **Chunked local attention** (used by Llama4): New attention mask builder in `rvllm-attention`. Reference `SlidingWindowConfig` in `sliding_window.rs` for per-layer behavior patterns.
+
+**Note on `AttentionBackend`**: There are two trait definitions — the real one in `crates/rvllm-attention/src/backend.rs` (cache-based: `query, key_cache, value_cache, block_tables, ...`) and a simplified bridge in `crates/rvllm-model-runner/src/bridge.rs` (used by architecture forward passes: `query, key, value, attention_metadata, layer_idx`). Chunked local attention for Llama4 may need implementation at both layers.
 
 ## Testing Strategy
 
@@ -175,12 +184,17 @@ For each new model:
 ## Implementation Order
 
 ```
-1. QK-Norm helper in layers/norm.rs  (shared dependency)
+1. Extract GemmaRMSNorm to layers/norm.rs, add standard QK-Norm helper (shared dependency)
 2. Qwen3                              (simplest, validates QK-Norm)
-3. Gemma3                             (validates per-layer RoPE theta)
+3. Gemma3                             (validates per-layer RoPE theta + Gemma QK-Norm)
 4. MoE sigmoid routing in layers/moe.rs (shared dependency for Llama4)
 5. Llama4                             (most complex, builds on everything above)
 ```
+
+**Line estimates** (implementation + tests, given ~100 test lines per existing model):
+- Qwen3: ~250-300 lines total
+- Gemma3: ~400-450 lines total
+- Llama4: ~700-900 lines total
 
 ## Files Changed
 
