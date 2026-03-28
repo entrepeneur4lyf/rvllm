@@ -46,10 +46,6 @@ pub mod prelude {
     pub use crate::cublaslt_ops::{CublasLtOps, CUBLASLT_M_THRESHOLD};
     #[cfg(feature = "cuda")]
     pub use crate::cuda_allocator::CudaGpuAllocator;
-    #[cfg(feature = "cuda")]
-    pub use crate::CudaContext;
-    #[cfg(feature = "cuda")]
-    pub use crate::CudaStream;
     pub use crate::cuda_graph::{padded_batch_size, CudaGraph, CudaGraphPool, GRAPH_BATCH_SIZES};
     pub use crate::device::{list_devices, GpuDevice, MemoryInfo};
     #[cfg(feature = "cuda")]
@@ -59,5 +55,9 @@ pub mod prelude {
     pub use crate::nccl::{NcclComm, NcclDataType, NcclGroup, NcclReduceOp, NcclUniqueId};
     pub use crate::pinned_memory::{PinnedBuffer, PinnedPool};
     pub use crate::stream::GpuStream;
+    #[cfg(feature = "cuda")]
+    pub use crate::CudaContext;
+    #[cfg(feature = "cuda")]
+    pub use crate::CudaStream;
     pub use crate::{LLMError, Result};
 }

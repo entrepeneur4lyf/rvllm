@@ -214,7 +214,7 @@ pub(crate) fn embed_tokens(
         if end <= embed.len() {
             out.extend_from_slice(&embed.data[start..end]);
         } else {
-            out.extend(std::iter::repeat(f16::ZERO).take(hidden));
+            out.extend(std::iter::repeat_n(f16::ZERO, hidden));
         }
     }
     GpuBuffer::from_vec(out, vec![token_ids.len(), hidden])

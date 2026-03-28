@@ -31,9 +31,9 @@ pub fn gemm_quantized(input: &[f32], weight: &QuantizedWeight) -> Result<Vec<f32
     let mut output = vec![0.0f32; rows];
     let mut row_buf = vec![0.0f32; cols];
 
-    for r in 0..rows {
+    for (r, out) in output.iter_mut().enumerate() {
         dequantize_row(weight, zeros, r, &mut row_buf)?;
-        output[r] = dot_product_chunked(&row_buf, input);
+        *out = dot_product_chunked(&row_buf, input);
     }
 
     Ok(output)
@@ -102,7 +102,7 @@ fn dequantize_row(
             let bits = weight.quant_config.bits;
             let group_size = weight.quant_config.group_size;
             let mask = (1u32 << bits) - 1;
-            let groups_per_row = (cols + group_size - 1) / group_size;
+            let groups_per_row = cols.div_ceil(group_size);
             let group_base = row * groups_per_row;
             let row_offset = row * cols;
 
@@ -112,7 +112,8 @@ fn dequantize_row(
                 let col_start = g * group_size;
                 let col_end = (col_start + group_size).min(cols);
 
-                for c in col_start..col_end {
+                for (c, buf_val) in buf[col_start..col_end].iter_mut().enumerate() {
+                    let c = col_start + c;
                     let idx = row_offset + c;
                     let bit_offset = (idx as u64) * (bits as u64);
                     let byte_offset = (bit_offset / 8) as usize;
@@ -135,13 +136,13 @@ fn dequantize_row(
                         r
                     };
                     let quantized = (raw >> bit_shift) & mask;
-                    buf[c] = (quantized as f32 - zero) * scale;
+                    *buf_val = (quantized as f32 - zero) * scale;
                 }
             }
         }
         QuantMethod::AWQ => {
             let group_size = weight.quant_config.group_size;
-            let groups_per_row = (cols + group_size - 1) / group_size;
+            let groups_per_row = cols.div_ceil(group_size);
             let group_base = row * groups_per_row;
             let row_offset = row * cols;
 
@@ -164,7 +165,7 @@ fn dequantize_row(
                 if c < col_end {
                     let idx = row_offset + c;
                     let byte_idx = idx / 2;
-                    let nibble = if idx % 2 == 0 {
+                    let nibble = if idx.is_multiple_of(2) {
                         weight.data[byte_idx] & 0x0F
                     } else {
                         (weight.data[byte_idx] >> 4) & 0x0F

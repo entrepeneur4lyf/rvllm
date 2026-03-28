@@ -11,7 +11,7 @@ pub fn dequantize_awq(
     let (rows, cols) = shape;
     let total = rows * cols;
     let mut output = vec![0.0f32; total];
-    let groups_per_row = (cols + group_size - 1) / group_size;
+    let groups_per_row = cols.div_ceil(group_size);
 
     for row in 0..rows {
         let row_offset = row * cols;
@@ -37,11 +37,11 @@ pub fn dequantize_awq(
                 pair[1] = (hi - zero) * scale;
             }
             // If group_size is odd, handle the last element
-            if group_size % 2 != 0 {
+            if !group_size.is_multiple_of(2) {
                 let last = group_size - 1;
                 let idx = base_idx + last;
                 let byte_idx = idx / 2;
-                let nibble = if idx % 2 == 0 {
+                let nibble = if idx.is_multiple_of(2) {
                     data[byte_idx] & 0x0F
                 } else {
                     (data[byte_idx] >> 4) & 0x0F
@@ -60,7 +60,7 @@ pub fn dequantize_awq(
             for (j, dst) in remainder.iter_mut().enumerate() {
                 let idx = base_idx + j;
                 let byte_idx = idx / 2;
-                let nibble = if idx % 2 == 0 {
+                let nibble = if idx.is_multiple_of(2) {
                     data[byte_idx] & 0x0F
                 } else {
                     (data[byte_idx] >> 4) & 0x0F
@@ -79,7 +79,7 @@ pub fn quantize_awq(
     shape: (usize, usize),
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     let (rows, cols) = shape;
-    let groups_per_row = (cols + group_size - 1) / group_size;
+    let groups_per_row = cols.div_ceil(group_size);
     let num_groups = rows * groups_per_row;
     let mut scales = vec![0.0f32; num_groups];
     let mut zeros = vec![0.0f32; num_groups];
@@ -108,7 +108,7 @@ pub fn quantize_awq(
 
     // Pack 4-bit values, two per byte
     let total = rows * cols;
-    let total_bytes = (total + 1) / 2;
+    let total_bytes = total.div_ceil(2);
     let mut data = vec![0u8; total_bytes];
 
     for row in 0..rows {

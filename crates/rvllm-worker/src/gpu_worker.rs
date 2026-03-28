@@ -342,12 +342,6 @@ pub struct GpuWorker {
     graph_runner: GraphRunner,
     /// Number of forward calls so far (for warmup before graph capture).
     forward_count: usize,
-    /// Pinned host buffer for async DtoH pipeline. Allocated on first use.
-    /// Sized to max graph batch size (32 i32 elements).
-    #[cfg(feature = "cuda")]
-    pinned_output: Option<cudarc::driver::PinnedHostSlice<i32>>,
-    /// Stored sync output for execute_launch/execute_collect pipeline.
-    pending_sync_output: Option<(ForwardOutput, Vec<SequenceGroupMetadata>)>,
 }
 
 impl GpuWorker {
@@ -365,36 +359,16 @@ impl GpuWorker {
         // pre-capture work create illegal cross-phase dependencies). Since we use
         // a single stream, event-based multi-stream sync is unnecessary.
         #[cfg(feature = "cuda")]
-        unsafe { context.disable_event_tracking(); }
+        unsafe {
+            context.disable_event_tracking();
+        }
 
         // Use a non-default stream for all GPU operations. The legacy default
         // stream (stream 0) does NOT support cuStreamBeginCapture, which is
         // required for CUDA graph capture/replay.
-        let stream = context.new_stream()
+        let stream = context
+            .new_stream()
             .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
-
-        // Set memory pool to never release freed memory (instant reuse).
-        // By default CUDA's pool may return memory to the OS aggressively;
-        // threshold=u64::MAX keeps all freed allocations in the pool.
-        unsafe {
-            use cudarc::driver::sys::{
-                cuDeviceGetDefaultMemPool, cuMemPoolSetAttribute,
-                CUmemPool_attribute, CUmemoryPool,
-            };
-            let mut pool: CUmemoryPool = std::ptr::null_mut();
-            let res = cuDeviceGetDefaultMemPool(&mut pool, device_id as i32);
-            if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
-                let mut threshold: u64 = u64::MAX;
-                cuMemPoolSetAttribute(
-                    pool,
-                    CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                    &mut threshold as *mut u64 as *mut std::ffi::c_void,
-                );
-                info!(device_id, "memory pool release threshold set to u64::MAX");
-            } else {
-                warn!(device_id, "failed to configure memory pool release threshold");
-            }
-        }
 
         let cublas = CublasHandle::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("failed to create CublasHandle: {}", e)))?;
@@ -459,9 +433,6 @@ impl GpuWorker {
             gpu_model_runner: None,
             graph_runner,
             forward_count: 0,
-            #[cfg(feature = "cuda")]
-            pinned_output: None,
-            pending_sync_output: None,
         })
     }
 
@@ -675,10 +646,6 @@ impl GpuWorker {
             if self.config.dtype.is_half() {
                 runner.enable_fp16();
                 info!("FP16 inference enabled (hgemm path)");
-                // Fuse QKV and gate+up weights for fewer GEMM calls per layer.
-                if let Err(e) = runner.fuse_weights() {
-                    warn!("weight fusion failed: {e} -- using unfused path");
-                }
             }
 
             // Pre-allocate cuBLAS workspace for CUDA graph capture.
@@ -687,7 +654,6 @@ impl GpuWorker {
                 warn!("cuBLAS graph workspace setup failed: {e} -- graph capture disabled");
                 self.graph_runner.pool_mut().disable();
             }
-
 
             self.gpu_model_runner = Some(runner);
             info!(
@@ -731,7 +697,9 @@ impl GpuWorker {
         &self,
         gpu_memory_utilization: f32,
     ) -> Result<(usize, usize)> {
-        let (free, _total) = self.context.mem_get_info()
+        let (free, _total) = self
+            .context
+            .mem_get_info()
             .map_err(|e| LLMError::GpuError(format!("mem_get_info failed: {e}")))?;
         let available = (free as f32 * gpu_memory_utilization) as usize;
 
@@ -776,87 +744,6 @@ impl GpuWorker {
         })
     }
 
-    /// Launch GPU work and return immediately. GPU computes asynchronously.
-    /// Call `execute_collect` to sync and get results.
-    /// Returns None if nothing to launch (empty metadata or non-graph path).
-    pub fn execute_launch(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<Option<usize>> {
-        if metadata.is_empty() {
-            return Ok(None);
-        }
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
-        let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
-        match fwd_output {
-            ForwardOutput::TokenIdsPending { actual_batch } => Ok(Some(actual_batch)),
-            _ => {
-                // Non-async path (prefill, capture, non-graph). Store output for collect.
-                self.pending_sync_output = Some((fwd_output, metadata.to_vec()));
-                Ok(None)
-            }
-        }
-    }
-
-    /// Collect results after execute_launch. Syncs GPU if async DtoH pending.
-    pub fn execute_collect(&mut self, actual_batch: Option<usize>, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
-        if let Some(batch) = actual_batch {
-            // Async path: sync and read from pinned buffer
-            let token_ids = self.collect_pending_tokens(batch)?;
-            let outputs = self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?;
-            return Ok(GpuWorkerOutput { outputs });
-        }
-        // Sync path: output was stored in pending_sync_output
-        if let Some((fwd_output, _stored_meta)) = self.pending_sync_output.take() {
-            let outputs = match fwd_output {
-                ForwardOutput::TokenIds(ref token_ids) => {
-                    self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
-                }
-                ForwardOutput::Logits(ref logits) => {
-                    self.sample_tokens(logits, metadata)?
-                }
-                ForwardOutput::TokenIdsPending { .. } => unreachable!(),
-            };
-            return Ok(GpuWorkerOutput { outputs });
-        }
-        Ok(GpuWorkerOutput { outputs: Vec::new() })
-    }
-
-    /// Execute with overlap: runs `during_gpu` closure while GPU computes.
-    /// The closure gets ~4ms of CPU time during the async graph replay path.
-    /// For sync paths (prefill, capture), the closure runs after GPU finishes.
-    pub fn execute_with_overlap<F: FnOnce()>(
-        &mut self,
-        metadata: &[SequenceGroupMetadata],
-        during_gpu: F,
-    ) -> Result<GpuWorkerOutput> {
-        if metadata.is_empty() {
-            during_gpu();
-            return Ok(GpuWorkerOutput { outputs: Vec::new() });
-        }
-
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
-        let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
-
-        let outputs = match fwd_output {
-            ForwardOutput::TokenIdsPending { actual_batch } => {
-                // GPU is computing async. Run the overlap closure NOW.
-                during_gpu();
-                // THEN sync and read results.
-                let token_ids = self.collect_pending_tokens(actual_batch)?;
-                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
-            }
-            ForwardOutput::TokenIds(ref token_ids) => {
-                during_gpu();
-                self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
-            }
-            ForwardOutput::Logits(ref logits) => {
-                during_gpu();
-                self.sample_tokens(logits, metadata)?
-            }
-        };
-        Ok(GpuWorkerOutput { outputs })
-    }
-
     /// Execute one inference step with real GPU matmuls.
     pub fn execute(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
         if metadata.is_empty() {
@@ -865,92 +752,46 @@ impl GpuWorker {
             });
         }
 
-        let t_start = std::time::Instant::now();
+        debug!(
+            device_id = self.device_id,
+            num_groups = metadata.len(),
+            "GpuWorker execute"
+        );
 
         let model_input = input::prepare_input(metadata, self.config.block_size)?;
-        let t_input = t_start.elapsed();
+        let total_tokens = model_input.num_tokens();
+
+        debug!(
+            num_tokens = total_tokens,
+            is_prefill = model_input.is_prefill,
+            "input prepared"
+        );
 
         let greedy_only = Self::all_greedy(metadata);
+
+        // Run real GPU forward pass with RoPE and KV cache
+        trace!(greedy_only, "gpu_worker: entering gpu_forward");
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
-        let t_forward = t_start.elapsed();
 
         let outputs = match fwd_output {
             ForwardOutput::TokenIds(ref token_ids) => {
+                trace!(
+                    num_ids = token_ids.len(),
+                    "gpu_worker: gpu argmax fast path"
+                );
                 self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
             }
-            ForwardOutput::TokenIdsPending { actual_batch } => {
-                // Async DtoH was enqueued. Sync now and read from pinned buffer.
-                let token_ids = self.collect_pending_tokens(actual_batch)?;
-                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
-            }
             ForwardOutput::Logits(ref logits) => {
+                trace!(logits_len = logits.len(), "gpu_worker: full logits path");
                 self.sample_tokens(logits, metadata)?
             }
         };
-        let t_sample = t_start.elapsed();
 
-        // Periodic timing report (every 64 steps)
-        self.forward_count += 0; // already incremented in gpu_forward_ex
-        if self.forward_count % 64 == 0 && self.forward_count > 0 {
-            let input_us = t_input.as_micros();
-            let forward_us = (t_forward - t_input).as_micros();
-            let sample_us = (t_sample - t_forward).as_micros();
-            let total_us = t_sample.as_micros();
-            info!(
-                input_us, forward_us, sample_us, total_us,
-                tokens = model_input.num_tokens(),
-                greedy = greedy_only,
-                "TIMING execute"
-            );
-        }
-
-        Ok(GpuWorkerOutput { outputs })
-    }
-
-    /// Launch GPU forward pass and enqueue async DtoH, returning immediately.
-    ///
-    /// Returns `Some(GpuWorkerOutput)` if the forward path is synchronous
-    /// (non-graph path, capture path), or `None` if async DtoH is pending
-    /// and the caller should do CPU work before calling `collect_async_output`.
-    pub fn execute_async(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<Option<GpuWorkerOutput>> {
-        if metadata.is_empty() {
-            return Ok(Some(GpuWorkerOutput {
-                outputs: Vec::new(),
-            }));
-        }
-
-        let model_input = input::prepare_input(metadata, self.config.block_size)?;
-        let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
-
-        match fwd_output {
-            ForwardOutput::TokenIdsPending { .. } => {
-                // Async DtoH in flight -- caller should do CPU work then call collect
-                Ok(None)
-            }
-            ForwardOutput::TokenIds(ref token_ids) => {
-                let outputs = self.sample_tokens_from_gpu_argmax(token_ids, metadata)?;
-                Ok(Some(GpuWorkerOutput { outputs }))
-            }
-            ForwardOutput::Logits(ref logits) => {
-                let outputs = self.sample_tokens(logits, metadata)?;
-                Ok(Some(GpuWorkerOutput { outputs }))
-            }
-        }
-    }
-
-    /// Synchronize the GPU stream and read the pending async DtoH output.
-    ///
-    /// Call after `execute_async` returned `None` (indicating async DtoH
-    /// is in flight). Does CPU work between the async launch and this call
-    /// to overlap with GPU compute + DtoH transfer.
-    pub fn collect_async_output(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
-        // Determine actual batch size from metadata
-        let actual_batch: usize = metadata.iter()
-            .map(|g| g.seq_data.len())
-            .sum();
-        let token_ids = self.collect_pending_tokens(actual_batch)?;
-        let outputs = self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?;
+        debug!(
+            device_id = self.device_id,
+            num_outputs = outputs.len(),
+            "execute done"
+        );
         Ok(GpuWorkerOutput { outputs })
     }
 
@@ -1031,9 +872,7 @@ impl GpuWorker {
     fn gpu_forward(&mut self, model_input: &ModelInput) -> Result<Vec<f32>> {
         match self.gpu_forward_ex(model_input, false)? {
             ForwardOutput::Logits(logits) => Ok(logits),
-            ForwardOutput::TokenIds(_) | ForwardOutput::TokenIdsPending { .. } => {
-                unreachable!("greedy_only=false must return Logits")
-            }
+            ForwardOutput::TokenIds(_) => unreachable!("greedy_only=false must return Logits"),
         }
     }
 
@@ -1057,7 +896,11 @@ impl GpuWorker {
 
         // Only use graphs for pure decode steps with greedy sampling
         let is_decode = !model_input.is_prefill
-            && model_input.attention_metadata.query_lens.iter().all(|&q| q == 1);
+            && model_input
+                .attention_metadata
+                .query_lens
+                .iter()
+                .all(|&q| q == 1);
 
         if !is_decode || !greedy_only || !self.graph_runner.is_enabled() {
             return self.raw_gpu_forward_ex(model_input, greedy_only);
@@ -1091,11 +934,10 @@ impl GpuWorker {
         let num_seqs = padded_input.attention_metadata.context_lens.len();
         let max_context_len = padded_input.attention_metadata.max_context_len;
 
-        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
-            LLMError::GpuError("GPU model runner not initialized".into())
-        })?;
-
-        let t0 = std::time::Instant::now();
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
 
         // Upload metadata into persistent GPU buffers (memcpy_htod at stable
         // GPU pointers). This runs on the runner's stream OUTSIDE any graph.
@@ -1104,41 +946,22 @@ impl GpuWorker {
             &padded_input.position_ids,
             &padded_input.attention_metadata,
         )?;
-        let t_upload = t0.elapsed();
 
         if self.graph_runner.has_graph_for(padded_batch) {
-            // -- REPLAY path (async DtoH pipeline) --
+            // -- REPLAY path --
+            // Metadata was just updated in-place above. The graph replays on
+            // the same stream, so the memcpy_htod ordering is guaranteed.
+            debug!(actual_batch, padded_batch, "replaying CUDA graph");
             let pool = self.graph_runner.pool();
             let graph = pool.get(actual_batch).ok_or_else(|| {
                 LLMError::GpuError("graph lookup failed after has_graph_for".into())
             })?;
             graph.replay(&self.compute_stream)?;
-            let t_replay = t0.elapsed();
 
-            // Lazily allocate pinned host buffer for async DtoH.
-            if self.pinned_output.is_none() {
-                let pinned = unsafe { self.context.alloc_pinned::<i32>(32) }
-                    .map_err(|e| LLMError::GpuError(format!("pinned alloc: {e}")))?;
-                self.pinned_output = Some(pinned);
-            }
-
-            // Enqueue async DtoH into pinned buffer (returns immediately).
-            let pinned = self.pinned_output.as_mut().unwrap();
-            runner.read_graph_output_async(actual_batch, pinned.as_mut_slice()
-                .map_err(|e| LLMError::GpuError(format!("pinned slice: {e}")))?)?;
-
-            if self.forward_count % 64 == 0 {
-                let upload_us = t_upload.as_micros();
-                let replay_us = (t_replay - t_upload).as_micros();
-                info!(
-                    upload_us, replay_us,
-                    total_us = t0.elapsed().as_micros(),
-                    batch = actual_batch,
-                    "TIMING graph_replay (async DtoH enqueued)"
-                );
-            }
-
-            return Ok(ForwardOutput::TokenIdsPending { actual_batch });
+            // DtoH read from persistent output buffer (outside graph).
+            let ids = runner.read_graph_output(num_tokens)?;
+            let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
+            return Ok(ForwardOutput::TokenIds(trimmed));
         }
 
         if self.forward_count > Self::GRAPH_WARMUP_CALLS
@@ -1154,7 +977,8 @@ impl GpuWorker {
             // Synchronize to drain all pending async ops (allocs, frees,
             // kernel completions) before starting graph capture.
             let cuda_stream = runner.cuda_stream().clone();
-            cuda_stream.synchronize()
+            cuda_stream
+                .synchronize()
                 .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
 
             // Re-upload metadata (warmup consumed the stream state).
@@ -1167,19 +991,20 @@ impl GpuWorker {
             // Begin capture on the model runner's stream.
             let capture_begin = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);
             if let Err(e) = capture_begin {
-                warn!("graph capture begin failed: {e} -- skipping capture for batch {padded_batch}");
+                warn!(
+                    "graph capture begin failed: {e} -- skipping capture for batch {padded_batch}"
+                );
                 self.graph_runner.mark_captured(padded_batch);
                 // Fall through to normal path below
             } else {
-                let result = runner.forward_gpu_only(
-                    num_tokens, num_seqs, max_context_len, false,
-                );
+                let result = runner.forward_gpu_only(num_tokens, num_seqs, max_context_len, false);
 
                 match result {
                     Ok(()) => {
-                        let graph = self.graph_runner.pool_mut().end_capture_on(
-                            &cuda_stream, padded_batch,
-                        )?;
+                        let graph = self
+                            .graph_runner
+                            .pool_mut()
+                            .end_capture_on(&cuda_stream, padded_batch)?;
                         self.graph_runner.pool_mut().insert(graph);
                         self.graph_runner.mark_captured(padded_batch);
                         info!(padded_batch, "CUDA graph captured successfully");
@@ -1191,9 +1016,10 @@ impl GpuWorker {
                     }
                     Err(e) => {
                         warn!("graph capture forward failed, falling back: {e}");
-                        let _ = self.graph_runner.pool_mut().end_capture_on(
-                            &cuda_stream, padded_batch,
-                        );
+                        let _ = self
+                            .graph_runner
+                            .pool_mut()
+                            .end_capture_on(&cuda_stream, padded_batch);
                         self.graph_runner.mark_captured(padded_batch);
                         // Fall through to normal path below
                     }
@@ -1203,19 +1029,14 @@ impl GpuWorker {
 
         // -- NORMAL path (pre-warmup or capture failure) --
         // Metadata already uploaded. Use forward_graph_body which includes DtoH.
-        let fwd_output = runner.forward_graph_body(
-            num_tokens, num_seqs, max_context_len, false, true,
-        )?;
+        let fwd_output =
+            runner.forward_graph_body(num_tokens, num_seqs, max_context_len, false, true)?;
 
         // Strip padding from output
         match fwd_output {
             ForwardOutput::TokenIds(ref ids) => {
                 let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
                 Ok(ForwardOutput::TokenIds(trimmed))
-            }
-            ForwardOutput::TokenIdsPending { .. } => {
-                // forward_graph_body doesn't produce pending output
-                unreachable!("forward_graph_body should not return TokenIdsPending")
             }
             ForwardOutput::Logits(ref logits) => {
                 let unpadded = self.graph_runner.unpad_logits(logits, actual_batch);
@@ -1858,27 +1679,6 @@ impl GpuWorker {
     }
 
     /// Fast path: convert GPU-side argmax token IDs to sampling results.
-    /// Synchronize the runner stream and read token IDs from the pinned buffer.
-    /// Called after an async DtoH was enqueued via `ForwardOutput::TokenIdsPending`.
-    #[cfg(feature = "cuda")]
-    fn collect_pending_tokens(&mut self, actual_batch: usize) -> Result<Vec<i32>> {
-        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
-            LLMError::GpuError("GPU model runner not initialized".into())
-        })?;
-        runner.sync_stream()?;
-        let pinned = self.pinned_output.as_ref().ok_or_else(|| {
-            LLMError::GpuError("pinned output buffer not allocated".into())
-        })?;
-        let slice = pinned.as_slice()
-            .map_err(|e| LLMError::GpuError(format!("pinned buf read: {e}")))?;
-        Ok(slice[..actual_batch].to_vec())
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    fn collect_pending_tokens(&mut self, _actual_batch: usize) -> Result<Vec<i32>> {
-        Err(LLMError::GpuError("async DtoH requires cuda feature".into()))
-    }
-
     /// Used when all requests in the batch use temperature=0 (greedy).
     /// The argmax kernel produces one token ID per input token row;
     /// we pick the last token per sequence (same logic as sample_tokens).

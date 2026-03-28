@@ -110,7 +110,11 @@ impl<T: Pod + Send> GpuBuffer<T> {
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            GpuBufferInner::Cuda { slice, context, stream } => {
+            GpuBufferInner::Cuda {
+                slice,
+                context,
+                stream,
+            } => {
                 context
                     .bind_to_thread()
                     .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
@@ -133,17 +137,26 @@ impl<T: Pod + Send> GpuBuffer<T> {
             #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
             GpuBufferInner::Mock { data, .. } => Ok(data.clone()),
             #[cfg(feature = "cuda")]
-            GpuBufferInner::Cuda { slice, context, stream } => {
+            GpuBufferInner::Cuda {
+                slice,
+                context,
+                stream,
+            } => {
                 context
                     .bind_to_thread()
                     .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
                 let (src_ptr, _sync) = slice.device_ptr(stream);
                 let mut host = vec![T::zeroed(); slice.len()];
                 unsafe {
-                    cudarc::driver::result::memcpy_dtoh_async(&mut host, src_ptr, stream.cu_stream())
+                    cudarc::driver::result::memcpy_dtoh_async(
+                        &mut host,
+                        src_ptr,
+                        stream.cu_stream(),
+                    )
                 }
                 .map_err(|e| crate::LLMError::MemoryError(format!("CUDA dtoh copy failed: {e}")))?;
-                stream.synchronize()
+                stream
+                    .synchronize()
                     .map_err(|e| crate::LLMError::MemoryError(format!("CUDA sync failed: {e}")))?;
                 Ok(host)
             }

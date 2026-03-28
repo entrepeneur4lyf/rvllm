@@ -429,7 +429,7 @@ mod tests {
                 context_lens: vec![3],
                 block_tables: vec![vec![0]],
                 query_lens: vec![1],
-                    max_context_len: 3,
+                max_context_len: 3,
             },
             is_prefill: true,
         }
@@ -476,7 +476,7 @@ mod tests {
                 context_lens: vec![1],
                 block_tables: vec![vec![0]],
                 query_lens: vec![1],
-                    max_context_len: 1,
+                max_context_len: 1,
             },
             is_prefill: false,
         };

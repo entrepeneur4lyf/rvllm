@@ -132,9 +132,9 @@ impl MoELayer {
         // Phase 3: Shared expert (always-on, batched over all tokens).
         if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(input)?;
-            for i in 0..output.len() {
-                let cur = output[i].to_f32();
-                output[i] = f16::from_f32(cur + shared_out.data[i].to_f32());
+            for (out, shared) in output.iter_mut().zip(shared_out.data.iter()) {
+                let cur = out.to_f32();
+                *out = f16::from_f32(cur + shared.to_f32());
             }
         }
 

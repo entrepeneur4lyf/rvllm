@@ -35,7 +35,7 @@ impl QuantizedWeight {
             return 1;
         }
         let cols = self.shape.1;
-        (cols + self.quant_config.group_size - 1) / self.quant_config.group_size
+        cols.div_ceil(self.quant_config.group_size)
     }
 }
 

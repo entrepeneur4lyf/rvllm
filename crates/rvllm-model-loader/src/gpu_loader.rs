@@ -85,8 +85,7 @@ mod inner {
                 continue;
             }
 
-            let (dtype_str, shape, tensor_bytes) =
-                parse_tensor_meta(meta, name, data, data_start)?;
+            let (dtype_str, shape, tensor_bytes) = parse_tensor_meta(meta, name, data, data_start)?;
             let numel: usize = shape.iter().product();
 
             let f32_host = convert_to_f32(tensor_bytes, dtype_str, numel, name)?;
@@ -170,8 +169,7 @@ mod inner {
                 continue;
             }
 
-            let (dtype_str, shape, tensor_bytes) =
-                parse_tensor_meta(meta, name, data, data_start)?;
+            let (dtype_str, shape, tensor_bytes) = parse_tensor_meta(meta, name, data, data_start)?;
             let numel: usize = shape.iter().product();
 
             let f16_host = convert_to_f16(tensor_bytes, dtype_str, numel, name)?;
@@ -273,9 +271,9 @@ mod inner {
         data: &'a [u8],
         data_start: usize,
     ) -> Result<(&'b str, Vec<usize>, &'a [u8])> {
-        let obj = meta.as_object().ok_or_else(|| {
-            LLMError::ModelError(format!("tensor {} has non-object meta", name))
-        })?;
+        let obj = meta
+            .as_object()
+            .ok_or_else(|| LLMError::ModelError(format!("tensor {} has non-object meta", name)))?;
 
         let dtype_str = obj
             .get("dtype")
@@ -297,9 +295,7 @@ mod inner {
         let offsets = obj
             .get("data_offsets")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                LLMError::ModelError(format!("tensor {} missing data_offsets", name))
-            })?;
+            .ok_or_else(|| LLMError::ModelError(format!("tensor {} missing data_offsets", name)))?;
 
         if offsets.len() != 2 {
             return Err(LLMError::ModelError(format!(

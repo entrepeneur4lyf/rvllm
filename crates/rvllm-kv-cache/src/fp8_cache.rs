@@ -202,16 +202,15 @@ pub fn quantize_heads(input: &[f32], num_heads: usize, head_dim: usize) -> (Vec<
     let mut output = vec![0u8; num_heads * head_dim];
     let mut scales = vec![0.0f32; num_heads];
 
-    for h in 0..num_heads {
+    for (h, scale) in scales.iter_mut().enumerate() {
         let base = h * head_dim;
         let head_slice = &input[base..base + head_dim];
 
         // Dynamic per-head scaling: absmax / FP8_MAX
         let absmax = head_slice.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
-        let scale = (absmax / FP8_E4M3_MAX).max(1e-12);
-        scales[h] = scale;
+        *scale = (absmax / FP8_E4M3_MAX).max(1e-12);
 
-        let inv_scale = 1.0 / scale;
+        let inv_scale = 1.0 / *scale;
         for d in 0..head_dim {
             output[base + d] = float_to_fp8_e4m3(head_slice[d] * inv_scale);
         }
@@ -231,9 +230,8 @@ pub fn dequantize_heads(
 ) -> Vec<f32> {
     let mut output = vec![0.0f32; num_heads * head_dim];
 
-    for h in 0..num_heads {
+    for (h, &scale) in scales.iter().enumerate() {
         let base = h * head_dim;
-        let scale = scales[h];
         for d in 0..head_dim {
             output[base + d] = fp8_e4m3_to_float(input[base + d]) * scale;
         }

@@ -43,6 +43,12 @@ pub struct SplitKvAttention {
     num_kv_heads: Option<usize>,
 }
 
+impl Default for SplitKvAttention {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SplitKvAttention {
     pub fn new() -> Self {
         Self { num_kv_heads: None }
@@ -74,11 +80,21 @@ impl AttentionBackend for SplitKvAttention {
         let max_blocks = block_tables.shape.get(1).copied().unwrap_or(0);
 
         if num_seqs == 0 {
-            return Ok(GpuBuffer { data: vec![], shape: vec![0, num_heads, head_dim] });
+            return Ok(GpuBuffer {
+                data: vec![],
+                shape: vec![0, num_heads, head_dim],
+            });
         }
 
         let num_splits = choose_num_splits(max_context_len);
-        trace!(num_seqs, num_heads, head_dim, num_splits, max_context_len, "split_kv forward");
+        trace!(
+            num_seqs,
+            num_heads,
+            head_dim,
+            num_splits,
+            max_context_len,
+            "split_kv forward"
+        );
 
         let mut output = vec![f16::ZERO; num_seqs * num_heads * head_dim];
 
@@ -88,7 +104,7 @@ impl AttentionBackend for SplitKvAttention {
                 continue;
             }
 
-            let actual_splits = num_splits.min(((ctx_len + 63) / 64).max(1));
+            let actual_splits = num_splits.min(ctx_len.div_ceil(64).max(1));
 
             for head in 0..num_heads {
                 let kv_head = if num_kv_heads == num_heads {
@@ -98,8 +114,8 @@ impl AttentionBackend for SplitKvAttention {
                 };
 
                 // Compute partials per split
-                let total_tiles = (ctx_len + 63) / 64;
-                let tiles_per_split = (total_tiles + actual_splits - 1) / actual_splits;
+                let total_tiles = ctx_len.div_ceil(64);
+                let tiles_per_split = total_tiles.div_ceil(actual_splits);
 
                 let mut split_outs: Vec<Vec<f32>> = Vec::new();
                 let mut split_maxes: Vec<f32> = Vec::new();
@@ -134,11 +150,9 @@ impl AttentionBackend for SplitKvAttention {
                             // Q * K dot product
                             let mut dot = 0.0f32;
                             for d in 0..head_dim {
-                                let q_val = query.data
-                                    [(seq * num_heads + head) * head_dim + d]
-                                    .to_f32();
-                                let k_idx = ((phys_block * block_size + page_off)
-                                    * num_kv_heads
+                                let q_val =
+                                    query.data[(seq * num_heads + head) * head_dim + d].to_f32();
+                                let k_idx = ((phys_block * block_size + page_off) * num_kv_heads
                                     + kv_head)
                                     * head_dim
                                     + d;
@@ -160,14 +174,13 @@ impl AttentionBackend for SplitKvAttention {
                             row_sum += weight;
 
                             // Accumulate V
-                            for d in 0..head_dim {
-                                let v_idx = ((phys_block * block_size + page_off)
-                                    * num_kv_heads
+                            for (d, acc_val) in acc.iter_mut().enumerate().take(head_dim) {
+                                let v_idx = ((phys_block * block_size + page_off) * num_kv_heads
                                     + kv_head)
                                     * head_dim
                                     + d;
                                 let v_val = value_cache.data[v_idx].to_f32();
-                                acc[d] += weight * v_val;
+                                *acc_val += weight * v_val;
                             }
                         }
                     }
@@ -193,8 +206,8 @@ impl AttentionBackend for SplitKvAttention {
                     }
                     let correction = (split_maxes[s] - global_max).exp();
                     combined_sum += correction * split_sums[s];
-                    for d in 0..head_dim {
-                        combined_out[d] += correction * split_outs[s][d];
+                    for (d, comb_val) in combined_out.iter_mut().enumerate().take(head_dim) {
+                        *comb_val += correction * split_outs[s][d];
                     }
                 }
 
@@ -203,8 +216,8 @@ impl AttentionBackend for SplitKvAttention {
                 } else {
                     0.0
                 };
-                for d in 0..head_dim {
-                    output[out_base + d] = f16::from_f32(combined_out[d] * inv_sum);
+                for (d, comb_val) in combined_out.iter().enumerate().take(head_dim) {
+                    output[out_base + d] = f16::from_f32(comb_val * inv_sum);
                 }
             }
         }
@@ -268,8 +281,7 @@ mod tests {
             &[
                 1.0, 2.0, 3.0, 4.0, // token 0
                 5.0, 6.0, 7.0, 8.0, // token 1
-                0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             ],
             vec![1, 4, 1, 4],
         );
@@ -279,7 +291,15 @@ mod tests {
         let backend = SplitKvAttention::new();
         let scale = 1.0f32 / (4.0f32).sqrt();
         let out = backend
-            .forward(&query, &key_cache, &value_cache, &block_tables, &context_lens, 2, scale)
+            .forward(
+                &query,
+                &key_cache,
+                &value_cache,
+                &block_tables,
+                &context_lens,
+                2,
+                scale,
+            )
             .unwrap();
 
         assert_eq!(out.shape, vec![1, 1, 4]);
@@ -299,7 +319,15 @@ mod tests {
 
         let backend = SplitKvAttention::new();
         let out = backend
-            .forward(&query, &key_cache, &value_cache, &block_tables, &context_lens, 0, 1.0)
+            .forward(
+                &query,
+                &key_cache,
+                &value_cache,
+                &block_tables,
+                &context_lens,
+                0,
+                1.0,
+            )
             .unwrap();
 
         assert_eq!(out.shape, vec![1, 1, 2]);

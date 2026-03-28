@@ -308,8 +308,8 @@ impl EmbeddingModel {
                 let mut embedding = vec![0.0f32; h];
                 for t in 0..num_tokens {
                     let start = t * h;
-                    for j in 0..h {
-                        embedding[j] += hidden_states.data[start + j].to_f32();
+                    for (j, emb) in embedding.iter_mut().enumerate() {
+                        *emb += hidden_states.data[start + j].to_f32();
                     }
                 }
                 let inv_n = 1.0 / num_tokens.max(1) as f32;
@@ -442,7 +442,7 @@ fn gelu(input: &GpuBuffer<f16>) -> GpuBuffer<f16> {
     for &v in &input.data {
         let x = v.to_f32();
         // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        let inner = 0.7978845608_f32 * (x + 0.044715 * x * x * x);
+        let inner = 0.797_884_6_f32 * (x + 0.044715 * x * x * x);
         let y = 0.5 * x * (1.0 + inner.tanh());
         out.push(f16::from_f32(y));
     }
@@ -480,7 +480,7 @@ mod tests {
                 context_lens: vec![],
                 block_tables: vec![],
                 query_lens: vec![1],
-                    max_context_len: 0,
+                max_context_len: 0,
             },
             is_prefill: true,
         }

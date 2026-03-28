@@ -33,7 +33,7 @@ pub async fn create_chat_completion(
     let sampling_params = req.to_sampling_params();
 
     // Check if tools are active
-    let tools_active = req.tools.as_ref().map_or(false, |t| !t.is_empty())
+    let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && !matches!(req.tool_choice.as_ref(), Some(ToolChoice::Mode(m)) if m == "none");
 
     // Build messages, optionally augmented with tool definitions

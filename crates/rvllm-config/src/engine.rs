@@ -10,7 +10,7 @@ use crate::scheduler::SchedulerConfigImpl;
 use crate::telemetry::TelemetryConfig;
 
 /// Top-level configuration composing every subsystem.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct EngineConfig {
     /// Model weights and tokenizer settings.
     pub model: ModelConfigImpl,
@@ -24,19 +24,6 @@ pub struct EngineConfig {
     pub device: DeviceConfig,
     /// Observability settings.
     pub telemetry: TelemetryConfig,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            model: ModelConfigImpl::default(),
-            cache: CacheConfigImpl::default(),
-            scheduler: SchedulerConfigImpl::default(),
-            parallel: ParallelConfigImpl::default(),
-            device: DeviceConfig::default(),
-            telemetry: TelemetryConfig::default(),
-        }
-    }
 }
 
 impl EngineConfig {

@@ -226,7 +226,7 @@ impl ChatCompletionToolRequest {
 
     /// Returns true if tools are provided and tool_choice is not "none".
     pub fn tools_enabled(&self) -> bool {
-        if self.tools.as_ref().map_or(true, |t| t.is_empty()) {
+        if self.tools.as_ref().is_none_or(|t| t.is_empty()) {
             return false;
         }
         if let Some(ToolChoice::Mode(ref m)) = self.tool_choice {
@@ -277,7 +277,7 @@ pub fn augment_messages_with_tools(
     let mut result = Vec::with_capacity(messages.len() + 1);
 
     // Check if there's already a system message
-    let has_system = messages.first().map_or(false, |m| m.role == "system");
+    let has_system = messages.first().is_some_and(|m| m.role == "system");
 
     if has_system {
         // Prepend tool definitions to existing system message

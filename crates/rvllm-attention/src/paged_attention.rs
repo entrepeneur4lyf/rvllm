@@ -139,15 +139,15 @@ impl AttentionBackend for PagedAttentionV2 {
                         let v_base =
                             ((phys_block * block_size + block_off) * num_heads + h) * head_dim;
                         let weight = w / sum_exp;
-                        for d in 0..head_dim {
-                            out_vec[d] += weight * value_cache.data[v_base + d].to_f32();
+                        for (d, out_val) in out_vec.iter_mut().enumerate().take(head_dim) {
+                            *out_val += weight * value_cache.data[v_base + d].to_f32();
                         }
                     }
 
                     // Write output
                     let o_start = (token_offset + t) * num_heads * head_dim + h * head_dim;
-                    for d in 0..head_dim {
-                        output[o_start + d] = f16::from_f32(out_vec[d]);
+                    for (d, out_val) in out_vec.iter().enumerate().take(head_dim) {
+                        output[o_start + d] = f16::from_f32(*out_val);
                     }
                 }
             }

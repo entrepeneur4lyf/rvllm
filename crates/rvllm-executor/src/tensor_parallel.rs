@@ -62,7 +62,7 @@ impl TensorParallelConfig {
 
     /// Compute the shard size for a dimension of the given total size.
     pub fn shard_size(&self, total: usize) -> Result<usize> {
-        if total % self.tp_size != 0 {
+        if !total.is_multiple_of(self.tp_size) {
             return Err(LLMError::ConfigError(format!(
                 "dimension {} not divisible by tp_size {}",
                 total, self.tp_size
@@ -97,7 +97,7 @@ impl ColumnParallelLinear {
         gather_output: bool,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
-        if out_features % tp.tp_size != 0 {
+        if !out_features.is_multiple_of(tp.tp_size) {
             return Err(LLMError::ConfigError(format!(
                 "out_features {} not divisible by tp_size {}",
                 out_features, tp.tp_size
@@ -141,7 +141,7 @@ impl ColumnParallelLinear {
         let in_f = self.in_features;
         let out_f = self.shard_out_features();
 
-        if x.len() % in_f != 0 {
+        if !x.len().is_multiple_of(in_f) {
             return Err(LLMError::ModelError(format!(
                 "column-parallel forward: input length {} not divisible by in_features {}",
                 x.len(),
@@ -203,7 +203,7 @@ impl RowParallelLinear {
         input_is_parallel: bool,
         tp: TensorParallelConfig,
     ) -> Result<Self> {
-        if in_features % tp.tp_size != 0 {
+        if !in_features.is_multiple_of(tp.tp_size) {
             return Err(LLMError::ConfigError(format!(
                 "in_features {} not divisible by tp_size {}",
                 in_features, tp.tp_size
@@ -235,7 +235,7 @@ impl RowParallelLinear {
         let in_f = self.shard_in_features();
         let out_f = self.out_features;
 
-        if x_shard.len() % in_f != 0 {
+        if !x_shard.len().is_multiple_of(in_f) {
             return Err(LLMError::ModelError(format!(
                 "row-parallel forward: input length {} not divisible by shard_in_features {}",
                 x_shard.len(),
@@ -345,19 +345,19 @@ impl TransformerLayerParallel {
         let qkv_out = (num_heads + 2 * num_kv_heads) * head_dim;
 
         // Validate divisibility
-        if num_heads % tp.tp_size != 0 {
+        if !num_heads.is_multiple_of(tp.tp_size) {
             return Err(LLMError::ConfigError(format!(
                 "num_heads {} not divisible by tp_size {}",
                 num_heads, tp.tp_size
             )));
         }
-        if num_kv_heads % tp.tp_size != 0 {
+        if !num_kv_heads.is_multiple_of(tp.tp_size) {
             return Err(LLMError::ConfigError(format!(
                 "num_kv_heads {} not divisible by tp_size {}",
                 num_kv_heads, tp.tp_size
             )));
         }
-        if intermediate_size % tp.tp_size != 0 {
+        if !intermediate_size.is_multiple_of(tp.tp_size) {
             return Err(LLMError::ConfigError(format!(
                 "intermediate_size {} not divisible by tp_size {}",
                 intermediate_size, tp.tp_size

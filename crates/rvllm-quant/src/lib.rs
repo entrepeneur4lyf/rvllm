@@ -72,7 +72,7 @@ pub fn detect_quant_method(model_path: &Path) -> Result<QuantMethod> {
         std::fs::read_dir(model_path).ok().and_then(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .find(|e| e.path().extension().map_or(false, |ext| ext == "gguf"))
+                .find(|e| e.path().extension().is_some_and(|ext| ext == "gguf"))
                 .map(|e| e.path())
         })
     };

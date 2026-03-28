@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Data type for model weights and compute precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Dtype {
     /// Automatic selection: float16 on SM >= 7.0 GPUs, float32 otherwise.
+    #[default]
     Auto,
     /// 32-bit floating point.
     Float32,
@@ -68,12 +70,6 @@ impl Dtype {
     /// Whether this dtype should use hgemm (half GEMM) vs sgemm (single GEMM).
     pub fn use_hgemm(self) -> bool {
         matches!(self, Dtype::Float16 | Dtype::BFloat16)
-    }
-}
-
-impl Default for Dtype {
-    fn default() -> Self {
-        Dtype::Auto
     }
 }
 

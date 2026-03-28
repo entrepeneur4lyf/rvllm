@@ -183,8 +183,7 @@ impl<T: Pod + Send> Drop for PinnedBuffer<T> {
             if !self.ptr.is_null() && self.len > 0 {
                 // SAFETY: ptr was allocated with cuMemAllocHost.
                 unsafe {
-                    let _ =
-                        cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
+                    let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
                 }
             }
         }

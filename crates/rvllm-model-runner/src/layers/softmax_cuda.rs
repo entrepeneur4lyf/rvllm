@@ -53,11 +53,11 @@ impl CudaSoftmax {
             .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
             .map_err(|e| LLMError::GpuError(format!("failed to load softmax PTX: {e}")))?;
 
-        let func = module
-            .load_function("softmax_kernel")
-            .map_err(|e| {
-                LLMError::GpuError(format!("softmax_kernel function not found in PTX module: {e}"))
-            })?;
+        let func = module.load_function("softmax_kernel").map_err(|e| {
+            LLMError::GpuError(format!(
+                "softmax_kernel function not found in PTX module: {e}"
+            ))
+        })?;
 
         trace!("CudaSoftmax: loaded softmax_kernel");
         Ok(Self { context, func })

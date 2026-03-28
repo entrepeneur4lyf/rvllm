@@ -23,6 +23,7 @@ pub trait AttentionBackend: Send + Sync {
     /// * `context_lens`    - `[num_seqs]`
     /// * `max_context_len` - maximum context length across all sequences
     /// * `scale`           - softmax scale factor (typically 1/sqrt(head_dim))
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         query: &GpuBuffer<f16>,

@@ -121,7 +121,7 @@ impl MemoryPool for CpuMemoryPool {
             .enumerate()
             .map(|(i, b)| CpuBlock::new(BlockId(i as u32), b.size_bytes()))
             .collect();
-        let _ = &inner; // hold lock during "transfer"
+        let _guard = &inner; // hold lock during "transfer"
         Ok(cpu_blocks)
     }
 
@@ -131,7 +131,7 @@ impl MemoryPool for CpuMemoryPool {
             .iter()
             .map(|b| PhysicalBlock::new(b.block_id(), b.size_bytes()))
             .collect();
-        let _ = &inner;
+        let _guard = &inner;
         Ok(gpu_blocks)
     }
 }

@@ -89,6 +89,7 @@ impl PySamplingParams {
         seed = None,
         logprobs = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         temperature: f32,
         top_p: f32,
@@ -160,6 +161,7 @@ impl PySampler {
     }
 
     #[pyo3(signature = (logits, temperature = 1.0, top_k = 0, top_p = 1.0, min_p = 0.0, seed = None, logprobs = None))]
+    #[allow(clippy::too_many_arguments)]
     fn sample(
         &self,
         logits: Vec<f32>,
@@ -309,7 +311,11 @@ impl PyEngineConfig {
             .model(
                 rvllm_config::ModelConfigImpl::builder()
                     .model_path(&self.model)
-                    .dtype(self.dtype.parse::<rvllm_core::types::Dtype>().unwrap_or_default())
+                    .dtype(
+                        self.dtype
+                            .parse::<rvllm_core::types::Dtype>()
+                            .unwrap_or_default(),
+                    )
                     .max_model_len(self.max_model_len)
                     .build(),
             )

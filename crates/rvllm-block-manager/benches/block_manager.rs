@@ -60,7 +60,9 @@ struct OldRefCounter {
 
 impl OldRefCounter {
     fn new() -> Self {
-        Self { counts: HashMap::new() }
+        Self {
+            counts: HashMap::new(),
+        }
     }
     #[inline]
     fn increment(&mut self, block_id: BlockId) {
@@ -84,7 +86,9 @@ struct NewRefCounter {
 
 impl NewRefCounter {
     fn new(capacity: usize) -> Self {
-        Self { counts: vec![0; capacity] }
+        Self {
+            counts: vec![0; capacity],
+        }
     }
     #[inline]
     fn increment(&mut self, block_id: BlockId) {
@@ -174,9 +178,8 @@ fn bench_cow_hot_path(c: &mut Criterion) {
                     let mut mgr = BlockManager::new(gpu, cpu, block_size);
                     mgr.set_watermark(0.0);
 
-                    let seqs: Vec<Sequence> = (0..n as u64)
-                        .map(|i| make_seq(i, tokens_per_seq))
-                        .collect();
+                    let seqs: Vec<Sequence> =
+                        (0..n as u64).map(|i| make_seq(i, tokens_per_seq)).collect();
 
                     // Allocate all
                     for seq in &seqs {
@@ -209,42 +212,42 @@ fn bench_fork_cow_cycle(c: &mut Criterion) {
         let tokens = 32 * block_size; // 32 blocks
         let total_blocks = (num_beams + 1) * 32 + 128;
 
-        group.bench_with_input(
-            BenchmarkId::new("beams", num_beams),
-            &num_beams,
-            |b, &n| {
-                b.iter(|| {
-                    let gpu = Arc::new(BenchPool::new(total_blocks));
-                    let cpu = Arc::new(BenchPool::new(16));
-                    let mut mgr = BlockManager::new(gpu, cpu, block_size);
-                    mgr.set_watermark(0.0);
+        group.bench_with_input(BenchmarkId::new("beams", num_beams), &num_beams, |b, &n| {
+            b.iter(|| {
+                let gpu = Arc::new(BenchPool::new(total_blocks));
+                let cpu = Arc::new(BenchPool::new(16));
+                let mut mgr = BlockManager::new(gpu, cpu, block_size);
+                mgr.set_watermark(0.0);
 
-                    let parent = make_seq(0, tokens);
-                    mgr.allocate(&parent).unwrap();
+                let parent = make_seq(0, tokens);
+                mgr.allocate(&parent).unwrap();
 
-                    let mut children: Vec<Sequence> = (1..=n as u64)
-                        .map(|i| make_seq(i, tokens))
-                        .collect();
+                let mut children: Vec<Sequence> =
+                    (1..=n as u64).map(|i| make_seq(i, tokens)).collect();
 
-                    for child in &mut children {
-                        mgr.fork(&parent, child).unwrap();
-                    }
+                for child in &mut children {
+                    mgr.fork(&parent, child).unwrap();
+                }
 
-                    for child in &children {
-                        black_box(mgr.cow_if_needed(child).unwrap());
-                    }
+                for child in &children {
+                    black_box(mgr.cow_if_needed(child).unwrap());
+                }
 
-                    for child in &children {
-                        mgr.free(child);
-                    }
-                    mgr.free(&parent);
-                })
-            },
-        );
+                for child in &children {
+                    mgr.free(child);
+                }
+                mgr.free(&parent);
+            })
+        });
     }
 
     group.finish();
 }
 
-criterion_group!(benches, bench_ref_counter, bench_cow_hot_path, bench_fork_cow_cycle);
+criterion_group!(
+    benches,
+    bench_ref_counter,
+    bench_cow_hot_path,
+    bench_fork_cow_cycle
+);
 criterion_main!(benches);

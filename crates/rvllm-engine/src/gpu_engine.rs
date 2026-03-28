@@ -20,7 +20,9 @@ mod inner {
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
-    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
+    use rvllm_sequence::{
+        Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus,
+    };
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
@@ -751,7 +753,10 @@ mod inner {
                     }
                 }
             }
-            info!(num_completed = all_outputs.len(), "GpuLLMEngine: run loop finished");
+            info!(
+                num_completed = all_outputs.len(),
+                "GpuLLMEngine: run loop finished"
+            );
             Ok(all_outputs)
         }
 
@@ -821,10 +826,7 @@ mod inner {
             let mut output_map: HashMap<u64, (TokenId, LogProb, &[(TokenId, LogProb)])> =
                 HashMap::with_capacity(worker_outputs.outputs.len());
             for wo in &worker_outputs.outputs {
-                output_map.insert(
-                    wo.seq_id,
-                    (wo.token_id, wo.logprob, &wo.top_logprobs),
-                );
+                output_map.insert(wo.seq_id, (wo.token_id, wo.logprob, &wo.top_logprobs));
             }
 
             let mut results = Vec::with_capacity(scheduled_groups.len());
@@ -897,10 +899,8 @@ mod inner {
                     if all_finished {
                         for state in &mut req.seq_states {
                             if !state.token_ids.is_empty() && state.text.is_empty() {
-                                state.text = self
-                                    .tokenizer
-                                    .decode(&state.token_ids)
-                                    .unwrap_or_default();
+                                state.text =
+                                    self.tokenizer.decode(&state.token_ids).unwrap_or_default();
                             }
                         }
                     }
@@ -932,8 +932,7 @@ mod inner {
 
         /// Recycle KV cache blocks from sequences no longer tracked by scheduler.
         fn recycle_dead_blocks(&mut self) {
-            let live_seq_ids: std::collections::HashSet<SequenceId> =
-                self.scheduler.live_seq_ids();
+            let live_seq_ids: std::collections::HashSet<SequenceId> = self.scheduler.live_seq_ids();
             let dead_sids: Vec<SequenceId> = self
                 .seq_block_tables
                 .keys()
@@ -983,7 +982,10 @@ mod inner {
         fn build_metadata(
             &mut self,
             groups: &[SequenceGroup],
-        ) -> (Vec<SequenceGroupMetadata>, std::collections::HashSet<SequenceId>) {
+        ) -> (
+            Vec<SequenceGroupMetadata>,
+            std::collections::HashSet<SequenceId>,
+        ) {
             let block_size = self.config.cache.block_size;
             let mut metadata = Vec::with_capacity(groups.len());
             let mut aborted_seqs: std::collections::HashSet<SequenceId> =
@@ -1036,7 +1038,8 @@ mod inner {
                             }
                         }
                         // Mark finished so the scheduler drops it next round.
-                        self.scheduler.finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                        self.scheduler
+                            .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
                         aborted_seqs.insert(seq.seq_id);
                         continue;
                     }

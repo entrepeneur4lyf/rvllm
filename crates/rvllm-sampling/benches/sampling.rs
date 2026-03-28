@@ -121,5 +121,11 @@ fn bench_repetition_penalty(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_greedy, bench_top_p, bench_top_k, bench_repetition_penalty);
+criterion_group!(
+    benches,
+    bench_greedy,
+    bench_top_p,
+    bench_top_k,
+    bench_repetition_penalty
+);
 criterion_main!(benches);

@@ -26,7 +26,11 @@ impl CublasHandle {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         let blas = CudaBlas::new(stream.clone())
             .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS init failed: {e}")))?;
-        Ok(Self { blas, stream, graph_workspace: None })
+        Ok(Self {
+            blas,
+            stream,
+            graph_workspace: None,
+        })
     }
 
     /// Returns a reference to the underlying stream.
@@ -50,11 +54,10 @@ impl CublasHandle {
             "allocating cuBLAS graph workspace"
         );
 
-        let mut ws = self.stream
+        let mut ws = self
+            .stream
             .alloc_zeros::<u8>(CUBLAS_GRAPH_WORKSPACE_BYTES)
-            .map_err(|e| crate::LLMError::GpuError(
-                format!("cuBLAS workspace alloc: {e}")
-            ))?;
+            .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS workspace alloc: {e}")))?;
 
         // Get raw device pointer and call cublasSetWorkspace_v2 in a scoped
         // borrow so we can move `ws` into self.graph_workspace afterwards.
@@ -67,9 +70,9 @@ impl CublasHandle {
                     CUBLAS_GRAPH_WORKSPACE_BYTES,
                 );
                 if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    return Err(crate::LLMError::GpuError(
-                        format!("cublasSetWorkspace_v2 failed: {status:?}")
-                    ));
+                    return Err(crate::LLMError::GpuError(format!(
+                        "cublasSetWorkspace_v2 failed: {status:?}"
+                    )));
                 }
             }
         }
@@ -260,9 +263,9 @@ impl CublasHandle {
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP,
             );
             if status != CUBLAS_STATUS_SUCCESS {
-                return Err(crate::LLMError::GpuError(
-                    format!("cublasGemmEx (f16xf16->f32) failed: {status:?}")
-                ));
+                return Err(crate::LLMError::GpuError(format!(
+                    "cublasGemmEx (f16xf16->f32) failed: {status:?}"
+                )));
             }
         }
         Ok(())

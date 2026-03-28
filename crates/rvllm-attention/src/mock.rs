@@ -85,14 +85,14 @@ impl AttentionBackend for MockAttentionBackend {
                 for (pos, &w) in exps.iter().enumerate() {
                     let v_off = (pos * kv_heads + h) * kv_dim;
                     let weight = w / sum_e;
-                    for d in 0..head_dim {
-                        out_vec[d] += weight * value_cache.data[v_off + d].to_f32();
+                    for (d, out_val) in out_vec.iter_mut().enumerate().take(head_dim) {
+                        *out_val += weight * value_cache.data[v_off + d].to_f32();
                     }
                 }
 
                 let o_off = (t * num_heads + h) * head_dim;
-                for d in 0..head_dim {
-                    output[o_off + d] = f16::from_f32(out_vec[d]);
+                for (d, out_val) in out_vec.iter().enumerate().take(head_dim) {
+                    output[o_off + d] = f16::from_f32(*out_val);
                 }
             }
         }

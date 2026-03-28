@@ -248,21 +248,17 @@ impl CudaCacheEngine {
                     LLMError::GpuError(format!("swap_in dtoh key layer {layer_idx}: {e}"))
                 })?;
                 key_host[gpu_off..gpu_off + epb].copy_from_slice(&key_cpu[cpu_off..cpu_off + epb]);
-                self.stream
-                    .memcpy_htod(&key_host, key_gpu)
-                    .map_err(|e| {
-                        LLMError::GpuError(format!("swap_in htod key layer {layer_idx}: {e}"))
-                    })?;
+                self.stream.memcpy_htod(&key_host, key_gpu).map_err(|e| {
+                    LLMError::GpuError(format!("swap_in htod key layer {layer_idx}: {e}"))
+                })?;
 
                 let mut val_host = self.stream.clone_dtoh(val_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_in dtoh val layer {layer_idx}: {e}"))
                 })?;
                 val_host[gpu_off..gpu_off + epb].copy_from_slice(&val_cpu[cpu_off..cpu_off + epb]);
-                self.stream
-                    .memcpy_htod(&val_host, val_gpu)
-                    .map_err(|e| {
-                        LLMError::GpuError(format!("swap_in htod val layer {layer_idx}: {e}"))
-                    })?;
+                self.stream.memcpy_htod(&val_host, val_gpu).map_err(|e| {
+                    LLMError::GpuError(format!("swap_in htod val layer {layer_idx}: {e}"))
+                })?;
             }
         }
 

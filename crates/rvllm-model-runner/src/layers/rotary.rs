@@ -62,8 +62,8 @@ impl RotaryEmbedding {
 
         let half_dim = self.half_dim;
 
-        for t in 0..num_tokens {
-            let pos = positions[t] as usize;
+        for (t, &pos_val) in positions.iter().enumerate() {
+            let pos = pos_val as usize;
             let cache_off = pos * half_dim;
 
             let num_q_heads = q_total / self.head_dim;

@@ -13,7 +13,7 @@ pub fn dequantize_gptq(
     let total = rows * cols;
     let mut output = vec![0.0f32; total];
     let mask = (1u32 << bits) - 1;
-    let groups_per_row = (cols + group_size - 1) / group_size;
+    let groups_per_row = cols.div_ceil(group_size);
 
     for row in 0..rows {
         let row_offset = row * cols;
@@ -92,7 +92,7 @@ pub fn quantize_gptq(
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     let (rows, cols) = shape;
     let max_val = (1u32 << bits) - 1;
-    let groups_per_row = (cols + group_size - 1) / group_size;
+    let groups_per_row = cols.div_ceil(group_size);
     let num_groups = rows * groups_per_row;
     let mut scales = vec![0.0f32; num_groups];
     let mut zeros = vec![0.0f32; num_groups];
@@ -126,7 +126,7 @@ pub fn quantize_gptq(
 
     // Pack quantized values bit-by-bit
     let total_bits = (rows * cols) as u64 * bits as u64;
-    let total_bytes = ((total_bits + 7) / 8) as usize;
+    let total_bytes = total_bits.div_ceil(8) as usize;
     let mut data = vec![0u8; total_bytes];
 
     for row in 0..rows {

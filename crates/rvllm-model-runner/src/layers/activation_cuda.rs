@@ -212,13 +212,11 @@ mod inner {
         /// Load the activation PTX and extract `fused_silu_mul_kernel`.
         pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
             let module = load_activation_module(&context, ptx_bytes)?;
-            let func = module
-                .load_function("fused_silu_mul_kernel")
-                .map_err(|e| {
-                    LLMError::GpuError(format!(
-                        "fused_silu_mul_kernel not found in activation module: {e}"
-                    ))
-                })?;
+            let func = module.load_function("fused_silu_mul_kernel").map_err(|e| {
+                LLMError::GpuError(format!(
+                    "fused_silu_mul_kernel not found in activation module: {e}"
+                ))
+            })?;
             trace!("CudaFusedSiLUMul: loaded fused_silu_mul_kernel");
             Ok(Self { context, func })
         }
@@ -291,7 +289,7 @@ mod inner {
                     .launch_builder(&self.func)
                     .arg(&gate_ptr) // output (aliases gate)
                     .arg(&gate_ptr) // gate input
-                    .arg(&up_ptr)   // up input
+                    .arg(&up_ptr) // up input
                     .arg(&n_i32)
                     .launch(cfg)
                     .map_err(|e| {

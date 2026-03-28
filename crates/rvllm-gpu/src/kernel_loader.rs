@@ -66,7 +66,10 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     ("fused_residual_rmsnorm_f16", &["fused_residual_rmsnorm_f16_kernel"]),
     (
         "paged_attention",
-        &["paged_attention_v2_kernel", "paged_attention_v2_f16kv_kernel"],
+        &[
+            "paged_attention_v2_kernel",
+            "paged_attention_v2_f16kv_kernel",
+        ],
     ),
     (
         "split_kv_attention",
@@ -225,9 +228,10 @@ impl KernelLoader {
 
     /// Retrieve a loaded CUDA function by module and function name.
     pub fn get_func(&self, module: &str, function: &str) -> Result<CudaFunction> {
-        let m = self.modules.get(module).ok_or_else(|| {
-            crate::LLMError::GpuError(format!("module '{module}' not loaded"))
-        })?;
+        let m = self
+            .modules
+            .get(module)
+            .ok_or_else(|| crate::LLMError::GpuError(format!("module '{module}' not loaded")))?;
         m.load_function(function).map_err(|e| {
             crate::LLMError::GpuError(format!(
                 "function '{function}' not found in module '{module}': {e}"
@@ -436,7 +440,8 @@ mod tests {
     fn new_with_nonexistent_dir() {
         let context = CudaContext::new(0).unwrap();
         let stream = context.new_stream().unwrap();
-        let loader = KernelLoader::new(context, stream, &PathBuf::from("/nonexistent/path")).unwrap();
+        let loader =
+            KernelLoader::new(context, stream, &PathBuf::from("/nonexistent/path")).unwrap();
         assert!(loader.loaded_modules().is_empty());
     }
 }

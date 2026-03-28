@@ -133,7 +133,6 @@ impl GuidedDecodingState {
         match valid {
             ValidChars::Any => {
                 // Everything allowed, no masking needed
-                return;
             }
             ValidChars::End => {
                 // Only EOS is allowed
@@ -142,7 +141,6 @@ impl GuidedDecodingState {
                         *l = f32::NEG_INFINITY;
                     }
                 }
-                return;
             }
             ValidChars::Set(ref allowed_bytes) => {
                 self.apply_char_mask(logits, vocab, allowed_bytes);
@@ -230,7 +228,7 @@ impl GuidedDecodingState {
             }
         }
         // Also check whitespace chars
-        for &b in &[b'\n', b'\t', b'\r'] {
+        for &b in b"\n\t\r" {
             let mut candidate = self.generated.clone();
             candidate.push(b as char);
             if regex_prefix_possible(&candidate, pattern) {
@@ -419,12 +417,10 @@ fn prefix_match_recursive(text: &[u8], ti: usize, pattern: &[char], pi: usize) -
             }
             _ => unreachable!(),
         }
+    } else if char_matches(text[ti], pc, pattern, pi) {
+        prefix_match_recursive(text, ti + 1, pattern, pi + ew)
     } else {
-        if char_matches(text[ti], pc, pattern, pi) {
-            prefix_match_recursive(text, ti + 1, pattern, pi + ew)
-        } else {
-            false
-        }
+        false
     }
 }
 
@@ -488,12 +484,10 @@ fn full_match_recursive(text: &[u8], ti: usize, pattern: &[char], pi: usize) -> 
             }
             _ => unreachable!(),
         }
+    } else if char_matches(text[ti], pc, pattern, pi) {
+        full_match_recursive(text, ti + 1, pattern, pi + ew)
     } else {
-        if char_matches(text[ti], pc, pattern, pi) {
-            full_match_recursive(text, ti + 1, pattern, pi + ew)
-        } else {
-            false
-        }
+        false
     }
 }
 

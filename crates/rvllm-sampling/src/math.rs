@@ -67,8 +67,8 @@ pub fn softmax_into(logits: &[f32], out: &mut [f32]) {
             out[base + j] *= inv_sum;
         }
     }
-    for i in tail..tail + rem {
-        out[i] *= inv_sum;
+    for item in &mut out[tail..tail + rem] {
+        *item *= inv_sum;
     }
 }
 
@@ -101,16 +101,16 @@ pub fn log_softmax_into(logits: &[f32], out: &mut [f32]) {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut buf = [0.0f32; CHUNK];
-        for j in 0..CHUNK {
-            buf[j] = (logits[base + j] - max).exp();
+        for (j, item) in buf.iter_mut().enumerate() {
+            *item = (logits[base + j] - max).exp();
         }
-        for j in 0..CHUNK {
-            sum += buf[j];
+        for &val in &buf {
+            sum += val;
         }
     }
     let tail = chunks * CHUNK;
-    for i in tail..tail + rem {
-        sum += (logits[i] - max).exp();
+    for val in &logits[tail..tail + rem] {
+        sum += (*val - max).exp();
     }
 
     let lse = max + sum.ln();
@@ -122,8 +122,11 @@ pub fn log_softmax_into(logits: &[f32], out: &mut [f32]) {
             out[base + j] = logits[base + j] - lse;
         }
     }
-    for i in tail..tail + rem {
-        out[i] = logits[i] - lse;
+    for (o, l) in out[tail..tail + rem]
+        .iter_mut()
+        .zip(&logits[tail..tail + rem])
+    {
+        *o = *l - lse;
     }
 }
 
@@ -163,10 +166,10 @@ pub fn greedy_sample(logits: &[f32]) -> TokenId {
     }
 
     let tail = chunks * CHUNK;
-    for i in tail..tail + rem {
-        if logits[i] > best_val {
-            best_val = logits[i];
-            best_idx = i;
+    for (i, &val) in logits[tail..tail + rem].iter().enumerate() {
+        if val > best_val {
+            best_val = val;
+            best_idx = tail + i;
         }
     }
 
@@ -196,10 +199,10 @@ pub fn multinomial_sample(probs: &[f32], rng: &mut impl rand::Rng) -> TokenId {
         }
     }
     let tail = chunks * CHUNK;
-    for i in tail..tail + rem {
-        cumulative += probs[i];
+    for (i, &p) in probs[tail..tail + rem].iter().enumerate() {
+        cumulative += p;
         if r < cumulative {
-            return i as TokenId;
+            return (tail + i) as TokenId;
         }
     }
     (n.saturating_sub(1)) as TokenId
@@ -291,9 +294,9 @@ fn max_f32(xs: &[f32]) -> f32 {
         }
     }
     let tail = chunks * CHUNK;
-    for i in tail..tail + rem {
-        if xs[i] > best {
-            best = xs[i];
+    for &val in &xs[tail..tail + rem] {
+        if val > best {
+            best = val;
         }
     }
     best

@@ -34,3 +34,5 @@ build/
 *.fdb_latexmk
 *.synctex.gz
 .gitnexus
+
+reference/

@@ -142,9 +142,11 @@ impl CudaLinearLayer {
     ) -> Result<CudaSlice<f32>> {
         let stream = blas.stream();
 
-        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
+        let cast_f32_f16 = loader
+            .get_func("cast_fp", "cast_f32_to_f16_kernel")
             .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
-        let cast_f16_f32 = loader.get_func("cast_fp", "cast_f16_to_f32_kernel")
+        let cast_f16_f32 = loader
+            .get_func("cast_fp", "cast_f16_to_f32_kernel")
             .map_err(|e| LLMError::GpuError(format!("load cast_f16_to_f32_kernel: {e}")))?;
 
         // Cast input f32 -> f16
@@ -157,7 +159,9 @@ impl CudaLinearLayer {
 
         // hgemm: output = input @ weight^T
         blas.hgemm(
-            m, n, k,
+            m,
+            n,
+            k,
             f16::ONE,
             &input_f16,
             weight,
@@ -186,7 +190,8 @@ impl CudaLinearLayer {
         let stream = blas.stream();
 
         // Cast input f32 -> f16 (still needed; cuBLAS requires matching A/B types)
-        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
+        let cast_f32_f16 = loader
+            .get_func("cast_fp", "cast_f32_to_f16_kernel")
             .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
         let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
 
@@ -244,9 +249,11 @@ impl CudaLinearLayer {
 
         let stream = blas.stream();
 
-        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
+        let cast_f32_f16 = loader
+            .get_func("cast_fp", "cast_f32_to_f16_kernel")
             .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
-        let cast_f16_f32 = loader.get_func("cast_fp", "cast_f16_to_f32_kernel")
+        let cast_f16_f32 = loader
+            .get_func("cast_fp", "cast_f16_to_f32_kernel")
             .map_err(|e| LLMError::GpuError(format!("load cast_f16_to_f32_kernel: {e}")))?;
 
         let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;

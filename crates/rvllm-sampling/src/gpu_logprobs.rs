@@ -135,13 +135,13 @@ pub fn compute_prompt_logprobs(
 
     // For positions 1..n, use logits[i-1] to score prompt_tokens[i]
     // because logits[i-1] gives P(token | prefix[..i])
-    for i in 1..prompt_tokens.len() {
+    for (i, &token) in prompt_tokens.iter().enumerate().skip(1) {
         let logit_offset = (i - 1) * vocab_size;
         let logit_end = logit_offset + vocab_size;
         if logit_end <= logits.len() {
             results.push(compute_position_logprobs(
                 &logits[logit_offset..logit_end],
-                prompt_tokens[i],
+                token,
                 num_top,
             ));
         } else {

@@ -171,7 +171,7 @@ impl BlockManager {
     }
 
     fn blocks_needed(&self, num_tokens: usize) -> usize {
-        (num_tokens + self.block_size - 1) / self.block_size
+        num_tokens.div_ceil(self.block_size)
     }
 
     fn usable_gpu_blocks(&self) -> usize {

@@ -16,7 +16,7 @@ impl LinearLayer {
         bias_opt: Option<&GpuBuffer<f16>>,
     ) -> Result<GpuBuffer<f16>> {
         let in_features = weight.shape.get(1).copied().unwrap_or(1);
-        let out_features = weight.shape.get(0).copied().unwrap_or(1);
+        let out_features = weight.shape.first().copied().unwrap_or(1);
         let num_tokens = input.len() / in_features;
 
         let mut out = vec![f16::ZERO; num_tokens * out_features];

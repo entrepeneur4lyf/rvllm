@@ -154,14 +154,14 @@ mod inner {
             unsafe {
                 stream
                     .launch_builder(&self.kernel_fn)
-                    .arg(query)                // float* query
-                    .arg(key)                  // float* key
-                    .arg(&self.cos_cache)      // const float* cos_cache
-                    .arg(&self.sin_cache)      // const float* sin_cache
-                    .arg(positions)            // const int* positions
-                    .arg(&(num_tokens as i32))    // int num_tokens
-                    .arg(&(num_heads as i32))     // int num_heads
-                    .arg(&(num_kv_heads as i32))  // int num_kv_heads
+                    .arg(query) // float* query
+                    .arg(key) // float* key
+                    .arg(&self.cos_cache) // const float* cos_cache
+                    .arg(&self.sin_cache) // const float* sin_cache
+                    .arg(positions) // const int* positions
+                    .arg(&(num_tokens as i32)) // int num_tokens
+                    .arg(&(num_heads as i32)) // int num_heads
+                    .arg(&(num_kv_heads as i32)) // int num_kv_heads
                     .arg(&(self.head_dim as i32)) // int head_dim
                     .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("RoPE kernel launch: {e}")))?;

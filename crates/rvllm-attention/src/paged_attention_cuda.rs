@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaModule, CudaFunction, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
 use half::f16;
 use tracing::{debug, trace};
 
@@ -59,7 +61,12 @@ impl CudaPagedAttention {
             .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
 
         debug!("CudaPagedAttention initialized");
-        Ok(Self { context, stream, _module: module, func })
+        Ok(Self {
+            context,
+            stream,
+            _module: module,
+            func,
+        })
     }
 
     /// Convenience constructor that creates a CudaContext for the given ordinal.

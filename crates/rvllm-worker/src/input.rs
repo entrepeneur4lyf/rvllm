@@ -375,8 +375,12 @@ pub fn prepare_decode_reuse(
         for (seq_id, seq_data) in &group.seq_data {
             // Build all token ids in scratch buffer
             scratch.all_tokens.clear();
-            scratch.all_tokens.extend_from_slice(&seq_data.prompt_token_ids);
-            scratch.all_tokens.extend_from_slice(&seq_data.output_token_ids);
+            scratch
+                .all_tokens
+                .extend_from_slice(&seq_data.prompt_token_ids);
+            scratch
+                .all_tokens
+                .extend_from_slice(&seq_data.output_token_ids);
 
             let last_token = scratch.all_tokens.last().copied().unwrap_or(0);
             scratch.token_ids.push(last_token);
@@ -395,7 +399,9 @@ pub fn prepare_decode_reuse(
             let block_offset = (seq_len - 1) % block_size;
             if block_idx < bt.len() {
                 let physical_block = bt[block_idx].0;
-                scratch.slot_mapping.push(physical_block * block_size as u32 + block_offset as u32);
+                scratch
+                    .slot_mapping
+                    .push(physical_block * block_size as u32 + block_offset as u32);
             } else {
                 scratch.slot_mapping.push(0);
             }

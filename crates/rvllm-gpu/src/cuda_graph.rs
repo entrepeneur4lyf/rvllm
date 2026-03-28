@@ -52,9 +52,9 @@ impl CudaGraph {
     #[cfg(feature = "cuda-graphs")]
     pub fn replay(&self, _stream: &crate::stream::GpuStream) -> Result<()> {
         trace!(batch_size = self.batch_size, "replaying CUDA graph");
-        self.inner.launch().map_err(|e| {
-            LLMError::GpuError(format!("cuGraphLaunch failed: {e}"))
-        })?;
+        self.inner
+            .launch()
+            .map_err(|e| LLMError::GpuError(format!("cuGraphLaunch failed: {e}")))?;
         Ok(())
     }
 
@@ -154,9 +154,7 @@ impl CudaGraphPool {
         debug!("beginning CUDA graph capture");
         stream
             .cuda_stream()
-            .begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
-            )
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
             .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
         Ok(())
     }
@@ -180,10 +178,7 @@ impl CudaGraphPool {
             })?;
 
         info!(batch_size, "CUDA graph captured and instantiated");
-        Ok(CudaGraph {
-            batch_size,
-            inner,
-        })
+        Ok(CudaGraph { batch_size, inner })
     }
 
     /// Begin capture (no-op when cuda-graphs feature is off).
@@ -209,12 +204,13 @@ impl CudaGraphPool {
 
     /// Begin capturing a CUDA graph on a raw CudaStream (for use from GpuModelRunner).
     #[cfg(feature = "cuda-graphs")]
-    pub fn begin_capture_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+    pub fn begin_capture_on(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
         debug!("beginning CUDA graph capture (raw stream)");
         stream
-            .begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
-            )
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
             .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
         Ok(())
     }
@@ -236,16 +232,19 @@ impl CudaGraphPool {
                 LLMError::GpuError("cuStreamEndCapture returned null graph".to_string())
             })?;
 
-        info!(batch_size, "CUDA graph captured and instantiated (raw stream)");
-        Ok(CudaGraph {
+        info!(
             batch_size,
-            inner,
-        })
+            "CUDA graph captured and instantiated (raw stream)"
+        );
+        Ok(CudaGraph { batch_size, inner })
     }
 
     /// Begin capture (no-op when cuda-graphs feature is off, cuda still available).
     #[cfg(all(feature = "cuda", not(feature = "cuda-graphs")))]
-    pub fn begin_capture_on(&self, _stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+    pub fn begin_capture_on(
+        &self,
+        _stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
         debug!("beginning CUDA graph capture (raw stream, no-op)");
         Ok(())
     }

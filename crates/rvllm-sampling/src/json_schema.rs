@@ -504,9 +504,9 @@ impl<'a> ParseContext<'a> {
         // Digits are almost always valid continuation
         if last != b'-' || bytes.len() == 1 {
             // After minus or after digits
-            valid.extend_from_slice(&[b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9']);
+            valid.extend_from_slice(b"0123456789");
         } else {
-            valid.extend_from_slice(&[b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9']);
+            valid.extend_from_slice(b"0123456789");
         }
 
         // Decimal point if no dot yet and not integer-only, and last was a digit
@@ -527,7 +527,7 @@ impl<'a> ParseContext<'a> {
         }
 
         // Number could be complete if it ends with a digit
-        if last.is_ascii_digit() && bytes.len() > 0 {
+        if last.is_ascii_digit() && !bytes.is_empty() {
             // Check it's a valid number so far
             if remaining != "-" {
                 // The number could end here -- signal this by also allowing End
@@ -611,7 +611,7 @@ impl<'a> ParseContext<'a> {
                     }
                 }
                 // Allow whitespace
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 return ValidChars::Set(v);
             } else {
                 let mut v = Vec::new();
@@ -620,7 +620,7 @@ impl<'a> ParseContext<'a> {
                     ValidChars::Any => return ValidChars::Any,
                     ValidChars::End => {}
                 }
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 return ValidChars::Set(v);
             }
         }
@@ -638,13 +638,13 @@ impl<'a> ParseContext<'a> {
                     ValidChars::Any => return ValidChars::Any,
                     ValidChars::End => {}
                 }
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 ValidChars::Set(v)
             }
             _ => {
                 // Could be mid-value or end of value
                 let mut v = vec![b',', b']'];
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 // Also allow continuation of current value
                 ValidChars::Set(v)
             }
@@ -677,7 +677,7 @@ impl<'a> ParseContext<'a> {
                 v.push(b'}');
             }
             v.push(b'"'); // property name start
-            v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+            v.extend_from_slice(b" \n\t\r");
             return ValidChars::Set(v);
         }
 
@@ -690,7 +690,7 @@ impl<'a> ParseContext<'a> {
             b',' => {
                 // After comma, next key
                 let mut v = vec![b'"'];
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 ValidChars::Set(v)
             }
             b'{' => {
@@ -701,13 +701,13 @@ impl<'a> ParseContext<'a> {
                     v.push(b'}');
                 }
                 v.push(b'"');
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 ValidChars::Set(v)
             }
             _ => {
                 // Could be mid-key, mid-value, or between entries
                 let mut v = vec![b',', b'}', b':'];
-                v.extend_from_slice(&[b' ', b'\n', b'\t', b'\r']);
+                v.extend_from_slice(b" \n\t\r");
                 // Allow continuation of current token
                 ValidChars::Set(v)
             }

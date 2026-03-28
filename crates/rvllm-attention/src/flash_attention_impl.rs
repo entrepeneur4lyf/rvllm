@@ -104,10 +104,16 @@ impl FlashAttention2 {
 
         let prefill_func = module
             .load_function("flash_attention_2_kernel")
-            .map_err(|e| LLMError::GpuError(format!("failed to load flash_attention_2_kernel: {e}")))?;
+            .map_err(|e| {
+                LLMError::GpuError(format!("failed to load flash_attention_2_kernel: {e}"))
+            })?;
         let decode_func = module
             .load_function("flash_attention_2_decode_kernel")
-            .map_err(|e| LLMError::GpuError(format!("failed to load flash_attention_2_decode_kernel: {e}")))?;
+            .map_err(|e| {
+                LLMError::GpuError(format!(
+                    "failed to load flash_attention_2_decode_kernel: {e}"
+                ))
+            })?;
 
         let stream = context
             .new_stream()
@@ -142,6 +148,7 @@ impl FlashAttention2 {
     /// - Stream K/V in tiles of size `TILE_BC`
     /// - Online softmax with running max/sum (Milakov & Gimelshein)
     /// - No full N x N attention matrix materialized
+    #[allow(clippy::too_many_arguments)]
     fn forward_cpu(
         &self,
         query: &GpuBuffer<f16>,
@@ -200,7 +207,7 @@ impl FlashAttention2 {
                 (num_tokens - token_offset).max(1)
             };
 
-            let num_tiles = (ctx_len + TILE_BC - 1) / TILE_BC;
+            let num_tiles = ctx_len.div_ceil(TILE_BC);
 
             for qi in 0..q_len {
                 let q_pos = token_offset + qi;
@@ -308,8 +315,8 @@ impl FlashAttention2 {
                                 + kv_h)
                                 * head_dim;
 
-                            for d in 0..head_dim {
-                                acc[d] += w * value_cache.data[v_base + d].to_f32();
+                            for (d, acc_val) in acc.iter_mut().enumerate().take(head_dim) {
+                                *acc_val += w * value_cache.data[v_base + d].to_f32();
                             }
                         }
                     }
@@ -317,8 +324,8 @@ impl FlashAttention2 {
                     // Normalize and write output
                     let inv_sum = if row_sum > 0.0 { 1.0 / row_sum } else { 0.0 };
                     let o_base = (q_pos * num_heads + h) * head_dim;
-                    for d in 0..head_dim {
-                        output[o_base + d] = f16::from_f32(acc[d] * inv_sum);
+                    for (d, acc_val) in acc.iter().enumerate().take(head_dim) {
+                        output[o_base + d] = f16::from_f32(acc_val * inv_sum);
                     }
                 }
             }
@@ -433,7 +440,8 @@ impl FlashAttention2 {
             };
 
             unsafe {
-                stream.launch_builder(&state.decode_func)
+                stream
+                    .launch_builder(&state.decode_func)
                     .arg(&d_output)
                     .arg(&d_query)
                     .arg(&d_key)
@@ -484,7 +492,8 @@ impl FlashAttention2 {
             let p_causal: i32 = if self.config.causal { 1 } else { 0 };
 
             unsafe {
-                stream.launch_builder(&state.prefill_func)
+                stream
+                    .launch_builder(&state.prefill_func)
                     .arg(&d_output)
                     .arg(&d_query)
                     .arg(&d_key)

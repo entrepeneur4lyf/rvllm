@@ -5,13 +5,13 @@
 //! cudarc for device memory types.
 
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
-#[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg};
 #[cfg(feature = "cuda")]
 use rvllm_core::error::{LLMError, Result};
 #[cfg(feature = "cuda")]
 use rvllm_gpu::kernel_loader::KernelLoader;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// CUDA-backed RMSNorm layer.
 ///
@@ -155,16 +155,14 @@ impl CudaRMSNorm {
         unsafe {
             stream
                 .launch_builder(&func)
-                .arg(&raw_ptr)       // output (same ptr)
-                .arg(&raw_ptr)       // input  (same ptr)
+                .arg(&raw_ptr) // output (same ptr)
+                .arg(&raw_ptr) // input  (same ptr)
                 .arg(weight)
                 .arg(&eps)
                 .arg(&hidden_size_i32)
                 .launch(cfg)
                 .map_err(|e| {
-                    LLMError::GpuError(format!(
-                        "CudaRMSNorm: inplace kernel launch failed: {e}"
-                    ))
+                    LLMError::GpuError(format!("CudaRMSNorm: inplace kernel launch failed: {e}"))
                 })?;
         }
 

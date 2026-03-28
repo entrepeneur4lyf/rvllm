@@ -14,6 +14,7 @@ use tracing::debug;
 ///   block_offset = slot % block_size
 ///
 /// The cache buffers are shaped [num_blocks, block_size, num_heads, head_dim] (flattened).
+#[allow(clippy::too_many_arguments)]
 pub fn reshape_and_cache(
     key: &[f16],
     value: &[f16],

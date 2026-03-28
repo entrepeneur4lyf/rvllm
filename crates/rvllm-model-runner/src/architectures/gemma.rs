@@ -105,7 +105,7 @@ fn fused_gelu_mul(gate: &[f16], up: &[f16]) -> Vec<f16> {
     let mut out = Vec::with_capacity(len);
 
     const CHUNK: usize = 8;
-    const SQRT_2_OVER_PI: f32 = 0.7978845608_f32;
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
     const GELU_COEFF: f32 = 0.044715_f32;
 
     let chunks = len / CHUNK;
@@ -115,17 +115,17 @@ fn fused_gelu_mul(gate: &[f16], up: &[f16]) -> Vec<f16> {
         let base = c * CHUNK;
         let mut g = [0.0f32; CHUNK];
         let mut u = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            g[i] = gate[base + i].to_f32();
-            u[i] = up[base + i].to_f32();
+        for (i, (gi, ui)) in g.iter_mut().zip(u.iter_mut()).enumerate() {
+            *gi = gate[base + i].to_f32();
+            *ui = up[base + i].to_f32();
         }
-        for i in 0..CHUNK {
-            let x = g[i];
+        for (gi, ui) in g.iter_mut().zip(u.iter()) {
+            let x = *gi;
             let inner = SQRT_2_OVER_PI * (x + GELU_COEFF * x * x * x);
-            g[i] = 0.5 * x * (1.0 + inner.tanh()) * u[i];
+            *gi = 0.5 * x * (1.0 + inner.tanh()) * *ui;
         }
-        for i in 0..CHUNK {
-            out.push(f16::from_f32(g[i]));
+        for gi in g.iter() {
+            out.push(f16::from_f32(*gi));
         }
     }
 

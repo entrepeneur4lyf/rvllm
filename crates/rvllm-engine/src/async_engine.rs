@@ -173,18 +173,13 @@ impl AsyncLLMEngine {
             }
 
             // Drain all pending generate requests
-            loop {
-                match gen_rx.try_recv() {
-                    Ok(req) => {
-                        let rid = req.request_id;
-                        if let Err(e) = engine.add_request(rid, req.prompt, req.sampling_params) {
-                            error!(%rid, %e, "failed to add generate request");
-                            continue;
-                        }
-                        output_channels.insert(rid, req.output_tx);
-                    }
-                    Err(_) => break,
+            while let Ok(req) = gen_rx.try_recv() {
+                let rid = req.request_id;
+                if let Err(e) = engine.add_request(rid, req.prompt, req.sampling_params) {
+                    error!(%rid, %e, "failed to add generate request");
+                    continue;
                 }
+                output_channels.insert(rid, req.output_tx);
             }
 
             // If nothing to do, yield and wait briefly for new work

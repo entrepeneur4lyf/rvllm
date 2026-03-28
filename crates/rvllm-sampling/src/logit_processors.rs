@@ -45,9 +45,7 @@ pub fn apply_top_k(logits: &mut [f32], k: u32) {
     } else {
         let mut kept = 0;
         for l in logits.iter_mut() {
-            if *l > threshold {
-                kept += 1;
-            } else if *l == threshold && kept < k {
+            if *l > threshold || (*l == threshold && kept < k) {
                 kept += 1;
             } else {
                 *l = f32::NEG_INFINITY;

@@ -262,9 +262,9 @@ pub fn register_prefix_blocks(
 ) -> Vec<BlockId> {
     let num_full = tokens.len() / block_size;
     let mut newly_cached = Vec::new();
-    for block_idx in 0..num_full.min(block_ids.len()) {
-        if cache.insert(tokens, block_idx, block_ids[block_idx]) {
-            newly_cached.push(block_ids[block_idx]);
+    for (block_idx, &block_id) in block_ids.iter().enumerate().take(num_full) {
+        if cache.insert(tokens, block_idx, block_id) {
+            newly_cached.push(block_id);
         }
     }
     newly_cached

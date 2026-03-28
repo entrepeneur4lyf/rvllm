@@ -58,7 +58,7 @@ pub fn dequantize_q4_k_m(
 
 /// Quantize f32 values to Q4_0 format (for testing round-trips).
 pub fn quantize_q4_0(values: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>) {
-    let num_groups = (values.len() + group_size - 1) / group_size;
+    let num_groups = values.len().div_ceil(group_size);
     let mut data = Vec::with_capacity(num_groups * (group_size / 2));
     let mut scales = Vec::with_capacity(num_groups);
 
@@ -91,7 +91,7 @@ pub fn quantize_q4_0(values: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>) {
 
 /// Quantize f32 values to Q4_K_M format (for testing round-trips).
 pub fn quantize_q4_k_m(values: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
-    let num_groups = (values.len() + group_size - 1) / group_size;
+    let num_groups = values.len().div_ceil(group_size);
     let mut data = Vec::with_capacity(num_groups * (group_size / 2));
     let mut scales = Vec::with_capacity(num_groups);
     let mut mins = Vec::with_capacity(num_groups);

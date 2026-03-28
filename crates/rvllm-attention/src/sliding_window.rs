@@ -98,7 +98,7 @@ impl SlidingWindowAttention {
         }
         let start_pos = self.window_start(context_len);
         let first_block = start_pos / block_size;
-        let last_block = (context_len + block_size - 1) / block_size;
+        let last_block = context_len.div_ceil(block_size);
         (first_block, last_block)
     }
 
@@ -230,14 +230,14 @@ impl AttentionBackend for SlidingWindowAttention {
                         let v_base =
                             ((phys_block * block_size + block_off) * num_heads + h) * head_dim;
                         let weight = exp_scores[i] / sum_exp;
-                        for d in 0..head_dim {
-                            out_vec[d] += weight * value_cache.data[v_base + d].to_f32();
+                        for (d, out_val) in out_vec.iter_mut().enumerate().take(head_dim) {
+                            *out_val += weight * value_cache.data[v_base + d].to_f32();
                         }
                     }
 
                     let o_start = (token_offset + t) * num_heads * head_dim + h * head_dim;
-                    for d in 0..head_dim {
-                        output[o_start + d] = f16::from_f32(out_vec[d]);
+                    for (d, out_val) in out_vec.iter().enumerate().take(head_dim) {
+                        output[o_start + d] = f16::from_f32(*out_val);
                     }
                 }
             }

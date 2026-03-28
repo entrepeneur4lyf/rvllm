@@ -6,7 +6,7 @@ use half::f16;
 use crate::bridge::{GpuBuffer, Result};
 
 const CHUNK: usize = 8;
-const SQRT_2_OVER_PI: f32 = 0.7978845608_f32;
+const SQRT_2_OVER_PI: f32 = 0.797_884_6_f32;
 const GELU_COEFF: f32 = 0.044715_f32;
 
 #[inline(always)]
@@ -38,14 +38,14 @@ pub fn silu(input: &GpuBuffer<f16>) -> Result<GpuBuffer<f16>> {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut tmp = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            tmp[i] = data[base + i].to_f32();
+        for (i, item) in tmp.iter_mut().enumerate() {
+            *item = data[base + i].to_f32();
         }
-        for i in 0..CHUNK {
-            tmp[i] = silu_scalar(tmp[i]);
+        for item in tmp.iter_mut() {
+            *item = silu_scalar(*item);
         }
-        for i in 0..CHUNK {
-            out.push(f16::from_f32(tmp[i]));
+        for item in tmp.iter() {
+            out.push(f16::from_f32(*item));
         }
     }
 
@@ -69,14 +69,14 @@ pub fn silu_inplace(buf: &mut GpuBuffer<f16>) {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut tmp = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            tmp[i] = data[base + i].to_f32();
+        for (i, item) in tmp.iter_mut().enumerate() {
+            *item = data[base + i].to_f32();
         }
-        for i in 0..CHUNK {
-            tmp[i] = silu_scalar(tmp[i]);
+        for item in tmp.iter_mut() {
+            *item = silu_scalar(*item);
         }
-        for i in 0..CHUNK {
-            data[base + i] = f16::from_f32(tmp[i]);
+        for (i, item) in tmp.iter().enumerate() {
+            data[base + i] = f16::from_f32(*item);
         }
     }
 
@@ -97,15 +97,11 @@ pub fn silu_inplace_f32(data: &mut [f32]) {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut tmp = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            tmp[i] = data[base + i];
+        tmp.copy_from_slice(&data[base..base + CHUNK]);
+        for item in tmp.iter_mut() {
+            *item = silu_scalar(*item);
         }
-        for i in 0..CHUNK {
-            tmp[i] = silu_scalar(tmp[i]);
-        }
-        for i in 0..CHUNK {
-            data[base + i] = tmp[i];
-        }
+        data[base..base + CHUNK].copy_from_slice(&tmp);
     }
 
     let base = chunks * CHUNK;
@@ -124,15 +120,11 @@ pub fn gelu_inplace_f32(data: &mut [f32]) {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut tmp = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            tmp[i] = data[base + i];
+        tmp.copy_from_slice(&data[base..base + CHUNK]);
+        for item in tmp.iter_mut() {
+            *item = gelu_scalar(*item);
         }
-        for i in 0..CHUNK {
-            tmp[i] = gelu_scalar(tmp[i]);
-        }
-        for i in 0..CHUNK {
-            data[base + i] = tmp[i];
-        }
+        data[base..base + CHUNK].copy_from_slice(&tmp);
     }
 
     let base = chunks * CHUNK;
@@ -156,15 +148,15 @@ pub fn fused_silu_mul(gate: &[f16], up: &[f16]) -> Vec<f16> {
         let base = c * CHUNK;
         let mut g = [0.0f32; CHUNK];
         let mut u = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            g[i] = gate[base + i].to_f32();
-            u[i] = up[base + i].to_f32();
+        for (i, (gi, ui)) in g.iter_mut().zip(u.iter_mut()).enumerate() {
+            *gi = gate[base + i].to_f32();
+            *ui = up[base + i].to_f32();
         }
-        for i in 0..CHUNK {
-            g[i] = silu_scalar(g[i]) * u[i];
+        for (gi, ui) in g.iter_mut().zip(u.iter()) {
+            *gi = silu_scalar(*gi) * *ui;
         }
-        for i in 0..CHUNK {
-            out.push(f16::from_f32(g[i]));
+        for gi in g.iter() {
+            out.push(f16::from_f32(*gi));
         }
     }
 
@@ -191,14 +183,14 @@ pub fn gelu(input: &GpuBuffer<f16>) -> Result<GpuBuffer<f16>> {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut tmp = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            tmp[i] = data[base + i].to_f32();
+        for (i, item) in tmp.iter_mut().enumerate() {
+            *item = data[base + i].to_f32();
         }
-        for i in 0..CHUNK {
-            tmp[i] = gelu_scalar(tmp[i]);
+        for item in tmp.iter_mut() {
+            *item = gelu_scalar(*item);
         }
-        for i in 0..CHUNK {
-            out.push(f16::from_f32(tmp[i]));
+        for item in tmp.iter() {
+            out.push(f16::from_f32(*item));
         }
     }
 
@@ -222,14 +214,14 @@ pub fn gelu_inplace(buf: &mut GpuBuffer<f16>) {
     for c in 0..chunks {
         let base = c * CHUNK;
         let mut tmp = [0.0f32; CHUNK];
-        for i in 0..CHUNK {
-            tmp[i] = data[base + i].to_f32();
+        for (i, item) in tmp.iter_mut().enumerate() {
+            *item = data[base + i].to_f32();
         }
-        for i in 0..CHUNK {
-            tmp[i] = gelu_scalar(tmp[i]);
+        for item in tmp.iter_mut() {
+            *item = gelu_scalar(*item);
         }
-        for i in 0..CHUNK {
-            data[base + i] = f16::from_f32(tmp[i]);
+        for (i, item) in tmp.iter().enumerate() {
+            data[base + i] = f16::from_f32(*item);
         }
     }
 
