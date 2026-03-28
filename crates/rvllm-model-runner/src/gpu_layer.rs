@@ -87,6 +87,9 @@ mod inner {
         pub block_size: usize,
         /// True during prefill (prompt processing), false during decode.
         pub is_prefill: bool,
+        /// Per-sequence query token start positions: [num_seqs + 1] with sentinel.
+        /// Built from actual query token counts, NOT context_lens.
+        pub seq_start_pos: &'a CudaSlice<i32>,
         /// RoPE cos table on GPU: [max_position, head_dim/2].
         pub rope_cos: &'a CudaSlice<f32>,
         /// RoPE sin table on GPU: [max_position, head_dim/2].
@@ -237,6 +240,7 @@ mod inner {
                     input.value_cache,
                     input.block_tables,
                     input.context_lens,
+                    input.seq_start_pos,
                     num_tokens,
                     input.num_seqs,
                     num_heads,
@@ -691,6 +695,7 @@ mod inner {
             value_cache: &CudaSlice<f32>,
             block_tables: &CudaSlice<i32>,
             context_lens: &CudaSlice<i32>,
+            seq_start_pos: &CudaSlice<i32>,
             num_tokens: usize,
             num_seqs: usize,
             num_heads: usize,
@@ -741,29 +746,9 @@ mod inner {
                 shared_mem_bytes,
             };
 
-            // Build seq_start_pos from context_lens (cumulative prefix sum on CPU, upload).
-            // We upload num_seqs+1 entries with a sentinel = num_tokens at the end so the
-            // kernel can always read seq_start_pos[seq_idx+1] without bounds checking.
-            let ctx_host = device
-                .dtoh_sync_copy(context_lens)
-                .map_err(|e| LLMError::GpuError(format!("context_lens DtoH: {e}")))?;
-            let mut seq_starts = Vec::with_capacity(num_seqs + 1);
-            let mut pos = 0i32;
-            for &cl in &ctx_host {
-                seq_starts.push(pos);
-                pos += cl as i32;
-            }
-            // Sentinel: must equal num_tokens so last seq gets correct q_len
-            seq_starts.push(num_tokens as i32);
-            if pos != num_tokens as i32 {
-                return Err(LLMError::GpuError(format!(
-                    "prefill_attention: sum(context_lens)={pos} != num_tokens={num_tokens} -- \
-                     seq_start_pos would cause OOB on query/output buffers"
-                )));
-            }
-            let seq_start_pos_gpu: CudaSlice<i32> = device
-                .htod_sync_copy(&seq_starts)
-                .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
+            // seq_start_pos is pre-computed by the caller (gpu_runner.rs) from actual
+            // query token positions, not context_lens. This correctly handles mixed
+            // prefill+decode batches where context_lens != query token counts.
 
             let max_blocks_per_seq = if num_seqs > 0 {
                 (DeviceSlice::len(block_tables) / num_seqs) as i32
@@ -788,7 +773,7 @@ mod inner {
                 let mut vc_ptr = *DevicePtr::device_ptr(value_cache);
                 let mut bt_ptr = *DevicePtr::device_ptr(block_tables);
                 let mut cl_ptr = *DevicePtr::device_ptr(context_lens);
-                let mut ss_ptr = *DevicePtr::device_ptr(&seq_start_pos_gpu);
+                let mut ss_ptr = *DevicePtr::device_ptr(seq_start_pos);
                 let mut p_scale = scale;
                 let mut p_num_heads = num_heads as i32;
                 let mut p_num_kv = num_kv_heads as i32;

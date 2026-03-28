@@ -225,6 +225,20 @@ mod cuda_impl {
 
             let max_context_len = attn_meta.max_context_len;
 
+            // Build seq_start_pos from query_lens (not context_lens).
+            // query_lens[i] = prompt_len for prefill, 1 for decode. Sum == num_tokens.
+            let mut seq_starts_host = Vec::with_capacity(num_seqs + 1);
+            let mut pos = 0i32;
+            for &ql in &attn_meta.query_lens {
+                seq_starts_host.push(pos);
+                pos += ql as i32;
+            }
+            seq_starts_host.push(num_tokens as i32); // sentinel
+            let seq_start_pos_gpu: CudaSlice<i32> = self
+                .device
+                .htod_sync_copy(&seq_starts_host)
+                .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
+
             // Step 1: token embedding lookup
             info!("gpu_runner: embedding lookup");
             let mut hidden_states = self.embedding_lookup(token_ids)?;
@@ -251,6 +265,7 @@ mod cuda_impl {
                     max_context_len,
                     block_size,
                     is_prefill,
+                    seq_start_pos: &seq_start_pos_gpu,
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                 };

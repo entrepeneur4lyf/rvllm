@@ -22,6 +22,7 @@ pub fn prepare_input(metadata: &[SequenceGroupMetadata], block_size: usize) -> R
                 context_lens: Vec::new(),
                 block_tables: Vec::new(),
                 max_context_len: 0,
+                query_lens: Vec::new(),
             },
             is_prefill: true,
         });
@@ -95,6 +96,7 @@ fn prepare_prefill(metadata: &[SequenceGroupMetadata], block_size: usize) -> Res
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
+            query_lens: context_lens.clone(), // prefill: query_lens == context_lens
             context_lens,
             block_tables: block_tables_out,
             max_context_len,
@@ -152,6 +154,7 @@ fn prepare_decode(metadata: &[SequenceGroupMetadata], block_size: usize) -> Resu
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
+            query_lens: vec![1; context_lens.len()],
             context_lens,
             block_tables: block_tables_out,
             max_context_len,
@@ -208,6 +211,7 @@ fn prepare_prefill_refs(
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
+            query_lens: context_lens.clone(),
             context_lens,
             block_tables: block_tables_out,
             max_context_len,
@@ -263,6 +267,7 @@ fn prepare_decode_refs(
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
+            query_lens: vec![1; context_lens.len()],
             context_lens,
             block_tables: block_tables_out,
             max_context_len,
@@ -294,11 +299,15 @@ fn merge_inputs(prefill: ModelInput, decode: ModelInput) -> ModelInput {
         decode.attention_metadata.max_context_len,
     );
 
+    let mut query_lens = prefill.attention_metadata.query_lens;
+    query_lens.extend(decode.attention_metadata.query_lens);
+
     ModelInput {
         token_ids,
         position_ids,
         attention_metadata: AttentionMetadata {
             slot_mapping,
+            query_lens,
             context_lens,
             block_tables,
             max_context_len,

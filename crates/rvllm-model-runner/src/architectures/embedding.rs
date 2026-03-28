@@ -479,7 +479,8 @@ mod tests {
                 slot_mapping: vec![],
                 context_lens: vec![],
                 block_tables: vec![],
-                max_context_len: 0,
+                query_lens: vec![1],
+                    max_context_len: 0,
             },
             is_prefill: true,
         }

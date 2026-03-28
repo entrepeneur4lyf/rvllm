@@ -207,6 +207,7 @@ impl Worker {
                 attention_metadata: rvllm_model_runner::bridge::AttentionMetadata {
                     slot_mapping: vec![0],
                     context_lens: vec![1],
+                    query_lens: vec![1],
                     block_tables: vec![vec![0]],
                     max_context_len: 1,
                 },

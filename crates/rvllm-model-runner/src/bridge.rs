@@ -152,6 +152,8 @@ pub struct AttentionMetadata {
     pub context_lens: Vec<u32>,
     pub block_tables: Vec<Vec<u32>>,
     pub max_context_len: u32,
+    /// Query tokens per sequence: prompt_len for prefill, 1 for decode.
+    pub query_lens: Vec<u32>,
 }
 
 pub trait AttentionBackend: Send + Sync {

@@ -147,9 +147,11 @@ __global__ void flash_attention_2_kernel(
     // GQA: map query head to KV head
     const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx : (head_idx / (num_heads / num_kv_heads));
 
-    // Query start position for this sequence (for multi-token prefill)
+    // Query start position for this sequence (for multi-token prefill).
+    // seq_start_pos has num_seqs+1 entries (sentinel at end = num_query_tokens)
+    // so seq_start_pos[seq_idx+1] is always a valid read.
     const int q_start = (seq_start_pos != nullptr) ? seq_start_pos[seq_idx] : seq_idx;
-    const int q_len = (seq_start_pos != nullptr && seq_idx + 1 < gridDim.x)
+    const int q_len = (seq_start_pos != nullptr)
                       ? (seq_start_pos[seq_idx + 1] - q_start)
                       : (num_query_tokens - q_start);
 

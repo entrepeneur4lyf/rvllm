@@ -132,6 +132,7 @@ impl GraphRunner {
                 position_ids,
                 attention_metadata: AttentionMetadata {
                     slot_mapping,
+                    query_lens: vec![1; context_lens.len()],
                     context_lens,
                     block_tables,
                     max_context_len,
@@ -283,6 +284,7 @@ mod tests {
                 slot_mapping: vec![0; batch_size],
                 context_lens: vec![11; batch_size],
                 block_tables: vec![vec![0]; batch_size],
+                query_lens: vec![1; batch_size],
                 max_context_len: 11,
             },
             is_prefill: false,
@@ -296,6 +298,7 @@ mod tests {
             attention_metadata: AttentionMetadata {
                 slot_mapping: vec![0; seq_len],
                 context_lens: vec![seq_len as u32],
+                query_lens: vec![seq_len as u32],
                 block_tables: vec![vec![0]],
                 max_context_len: seq_len as u32,
             },
