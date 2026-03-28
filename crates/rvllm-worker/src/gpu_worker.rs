@@ -331,6 +331,8 @@ pub struct GpuWorker {
     /// Raw weight map preserved for deferred GpuModelRunner construction.
     #[cfg(feature = "cuda")]
     raw_weight_map: Option<HashMap<String, CudaSlice<f32>>>,
+    #[cfg(feature = "cuda")]
+    raw_weight_map_f16: Option<HashMap<String, CudaSlice<half::f16>>>,
     /// GPU-resident model runner (full forward pass on GPU, no CPU attention fallback).
     /// Constructed in init_cache() once cache geometry is known.
     #[cfg(feature = "cuda")]
@@ -398,6 +400,8 @@ impl GpuWorker {
             #[cfg(feature = "cuda")]
             raw_weight_map: None,
             #[cfg(feature = "cuda")]
+            raw_weight_map_f16: None,
+            #[cfg(feature = "cuda")]
             gpu_model_runner: None,
             graph_runner,
             forward_count: 0,
@@ -427,6 +431,18 @@ impl GpuWorker {
         #[cfg(feature = "cuda")]
         {
             self.raw_weight_map = Some(all_weights_full.clone());
+
+            // Also load f16 weights for hgemm path when dtype is half
+            if self.config.dtype.is_half() {
+                info!("loading f16 weights for hgemm path");
+                let f16_weights = rvllm_model_loader::gpu_loader::load_weights_to_gpu_f16(
+                    model_path,
+                    &self.device,
+                )
+                .map_err(|e| LLMError::GpuError(format!("f16 weight loading failed: {e}")))?;
+                info!("loaded {} f16 weight tensors", f16_weights.len());
+                self.raw_weight_map_f16 = Some(f16_weights);
+            }
         }
 
         let mut all_weights = all_weights_full;
@@ -553,7 +569,15 @@ impl GpuWorker {
             let raw_map = self.raw_weight_map.take().ok_or_else(|| {
                 LLMError::GpuError("raw weight map not available -- call load_weights first".into())
             })?;
-            let loader_weights = LoaderWeights::new(raw_map, HashMap::new());
+            let mut loader_weights = LoaderWeights::new(raw_map, HashMap::new());
+
+            // Insert f16 weights for hgemm path
+            if let Some(f16_map) = self.raw_weight_map_f16.take() {
+                for (name, slice) in f16_map {
+                    loader_weights.insert_f16(name, slice, vec![]);
+                }
+                info!("inserted f16 weights into model weight container");
+            }
 
             let block_size = self.config.block_size;
             let cache = rvllm_kv_cache::engine_cuda::CudaCacheEngine::new(
@@ -587,6 +611,11 @@ impl GpuWorker {
                 mr_config,
                 self.device.clone(),
             )?;
+
+            if self.config.dtype.is_half() {
+                runner.enable_fp16();
+                info!("FP16 inference enabled (hgemm path)");
+            }
 
             self.gpu_model_runner = Some(runner);
             info!(

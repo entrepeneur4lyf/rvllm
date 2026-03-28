@@ -395,7 +395,16 @@ mod inner {
             let tokenizer_path = config.model.tokenizer_path.as_deref().unwrap_or(model_name);
             let tokenizer = Tokenizer::from_pretrained(tokenizer_path)?;
 
-            // 4. Build WorkerConfig from real model config
+            // 4. Resolve dtype (Auto -> Float16 on SM >= 7.0)
+            let resolved_dtype = {
+                let devices = rvllm_gpu::device::list_devices();
+                let sm_major = devices.first().map(|d| d.compute_capability.0).unwrap_or(8);
+                let dt = config.model.dtype.resolve(sm_major);
+                info!(dtype = %dt, sm_major, "resolved dtype");
+                dt
+            };
+
+            // 5. Build WorkerConfig from real model config
             let worker_config = rvllm_worker::WorkerConfig {
                 device_id: 0,
                 num_layers: hf_config.num_hidden_layers,
@@ -412,7 +421,7 @@ mod inner {
                 tensor_parallel_size: config.parallel.tensor_parallel_size,
                 pipeline_parallel_size: config.parallel.pipeline_parallel_size,
                 architecture: hf_config.architecture.clone(),
-                dtype: config.model.dtype,
+                dtype: resolved_dtype,
                 rope_theta: hf_config.rope_theta,
                 partial_rotary_factor: hf_config.partial_rotary_factor,
                 attn_logit_softcapping: hf_config.attn_logit_softcapping,
