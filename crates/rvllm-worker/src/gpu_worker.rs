@@ -367,6 +367,29 @@ impl GpuWorker {
         let stream = context.new_stream()
             .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
 
+        // Set memory pool to never release freed memory (instant reuse).
+        // By default CUDA's pool may return memory to the OS aggressively;
+        // threshold=u64::MAX keeps all freed allocations in the pool.
+        unsafe {
+            use cudarc::driver::sys::{
+                cuDeviceGetDefaultMemPool, cuMemPoolSetAttribute,
+                CUmemPool_attribute, CUmemoryPool,
+            };
+            let mut pool: CUmemoryPool = std::ptr::null_mut();
+            let res = cuDeviceGetDefaultMemPool(&mut pool, device_id as i32);
+            if res == cudarc::driver::sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
+                let mut threshold: u64 = u64::MAX;
+                cuMemPoolSetAttribute(
+                    pool,
+                    CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    &mut threshold as *mut u64 as *mut std::ffi::c_void,
+                );
+                info!(device_id, "memory pool release threshold set to u64::MAX");
+            } else {
+                warn!(device_id, "failed to configure memory pool release threshold");
+            }
+        }
+
         let cublas = CublasHandle::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("failed to create CublasHandle: {}", e)))?;
 

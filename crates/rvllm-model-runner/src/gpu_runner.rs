@@ -26,7 +26,7 @@ mod cuda_impl {
 
     use std::cell::Cell;
 
-    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, DevicePtrMut, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -85,6 +85,19 @@ mod cuda_impl {
         fn slice(&self) -> &CudaSlice<i32> {
             self.buf.as_ref().expect("upload() must be called first")
         }
+    }
+
+    /// Pre-allocated f16 scratch buffers for the forward pass.
+    /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
+    struct F16LayerScratch {
+        qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
+        attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
+        o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
+        normed: CudaSlice<f16>,   // [max_tokens * hidden]
+        residual: CudaSlice<f16>, // [max_tokens * hidden]
+        gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
+        silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
+        down: CudaSlice<f16>,     // [max_tokens * hidden]
     }
 
     /// Element offsets into the packed metadata GPU buffer.
@@ -151,6 +164,9 @@ mod cuda_impl {
         final_norm_weight_f16: Option<CudaSlice<half::f16>>,
         /// Pre-converted f16 embed tokens table for f16 embedding lookup.
         embed_tokens_f16: Option<CudaSlice<half::f16>>,
+        /// Pre-allocated scratch buffers for the f16 forward pass.
+        /// One set reused across all layers. Allocated by fuse_weights().
+        f16_scratch: Option<F16LayerScratch>,
     }
 
     impl GpuModelRunner {
@@ -261,6 +277,7 @@ mod cuda_impl {
                 fused_qkv_bias_f16: Vec::new(),
                 final_norm_weight_f16: None,
                 embed_tokens_f16: None,
+                f16_scratch: None,
             })
         }
 
@@ -377,7 +394,48 @@ mod cuda_impl {
             }
 
             info!(num_layers, "pre-converted norm/bias/embed to f16");
+
+            self.alloc_scratch()?;
             Ok(())
+        }
+
+        /// Pre-allocate a reusable set of f16 scratch buffers for the forward pass.
+        /// Sized for max_batch_tokens (32). Since all layers are processed
+        /// sequentially, one set of buffers covers every layer.
+        fn alloc_scratch(&mut self) -> Result<()> {
+            let max_tokens: usize = 32; // max padded batch
+            let hidden = self.config.hidden_size;
+            let q_dim = self.config.num_heads * self.config.head_dim;
+            let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+            let qkv_dim = q_dim + kv_dim + kv_dim;
+            let intermediate = self.config.intermediate_size;
+
+            let alloc = |n: usize| -> Result<CudaSlice<f16>> {
+                self.stream.alloc_zeros::<f16>(n)
+                    .map_err(|e| LLMError::GpuError(format!("f16 scratch alloc ({n} elems): {e}")))
+            };
+
+            let scratch = F16LayerScratch {
+                qkv: alloc(max_tokens * qkv_dim)?,
+                attn_out: alloc(max_tokens * q_dim)?,
+                o_proj: alloc(max_tokens * hidden)?,
+                normed: alloc(max_tokens * hidden)?,
+                residual: alloc(max_tokens * hidden)?,
+                gate_up: alloc(max_tokens * intermediate * 2)?,
+                silu_out: alloc(max_tokens * intermediate)?,
+                down: alloc(max_tokens * hidden)?,
+            };
+
+            let total_bytes = (max_tokens * (qkv_dim + q_dim + hidden * 3 + intermediate * 3)) * 2;
+            info!(max_tokens, total_bytes, "f16 layer scratch allocated");
+            self.f16_scratch = Some(scratch);
+            Ok(())
+        }
+
+        /// Access the pre-allocated f16 scratch buffers.
+        /// Panics if called before fuse_weights().
+        pub fn f16_scratch(&self) -> &F16LayerScratch {
+            self.f16_scratch.as_ref().expect("f16_scratch not allocated; call fuse_weights() first")
         }
 
         pub fn forward(
@@ -1400,8 +1458,8 @@ mod cuda_impl {
             let kernel = self.loader
                 .get_func("embedding_gather_f16", "embedding_gather_f16_kernel")?;
 
-            let output = self.stream
-                .alloc_zeros::<f16>(num_tokens * hidden_size)
+            // Safety: embedding gather kernel writes all num_tokens * hidden_size elements
+            let output = unsafe { self.stream.alloc::<f16>(num_tokens * hidden_size) }
                 .map_err(|e| LLMError::GpuError(format!("embed_f16 alloc: {e}")))?;
 
             let meta_packed = self.meta_packed.borrow();
@@ -1440,7 +1498,8 @@ mod cuda_impl {
             n: usize,
             kernel: &cudarc::driver::CudaFunction,
         ) -> Result<CudaSlice<f16>> {
-            let mut output = stream.alloc_zeros::<f16>(n)
+            // Safety: cast kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("cast_f32_f16 alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((n as u32) + threads - 1) / threads;
@@ -1468,7 +1527,8 @@ mod cuda_impl {
             hidden_size: usize,
         ) -> Result<CudaSlice<f16>> {
             let num_tokens = input.len() / hidden_size;
-            let mut output = self.stream.alloc_zeros::<f16>(input.len())
+            // Safety: rms_norm kernel writes all elements
+            let mut output = unsafe { self.stream.alloc::<f16>(input.len()) }
                 .map_err(|e| LLMError::GpuError(format!("rms_norm_f16 alloc: {e}")))?;
             let block_threads = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -1490,6 +1550,35 @@ mod cuda_impl {
             Ok(output)
         }
 
+        /// In-place RMSNorm f16: normalizes `input` directly, no output allocation.
+        fn rms_norm_f16_inplace_runner(
+            &self,
+            input: &mut CudaSlice<f16>,
+            weight: &CudaSlice<f16>,
+            hidden_size: usize,
+        ) -> Result<()> {
+            let num_tokens = input.len() / hidden_size;
+            let block_threads = hidden_size.min(1024) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
+            };
+            let kernel = self.loader.get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
+            unsafe {
+                let (raw_ptr, _guard) = DevicePtrMut::device_ptr_mut(input, &self.stream);
+                self.stream.launch_builder(&kernel)
+                    .arg(&raw_ptr)
+                    .arg(&raw_ptr)
+                    .arg(weight)
+                    .arg(&self.rms_norm_eps)
+                    .arg(&(hidden_size as i32))
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("rms_norm_f16_inplace launch: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// Fused LM-head matvec + argmax for single-token greedy decode (f16 weights, f16 hidden).
         /// Casts f16 hidden -> f32 internally since the kernel expects f32 hidden.
         fn gpu_fused_lm_head_argmax_f16_hidden(
@@ -1501,7 +1590,8 @@ mod cuda_impl {
         ) -> Result<CudaSlice<i32>> {
             // Cast f16 hidden -> f32 for the LM head kernel
             let cast_kernel = self.loader.get_func("cast_fp", "cast_f16_to_f32_kernel")?;
-            let mut hidden_f32 = self.stream.alloc_zeros::<f32>(hidden_size)
+            // Safety: cast kernel writes all hidden_size elements
+            let mut hidden_f32 = unsafe { self.stream.alloc::<f32>(hidden_size) }
                 .map_err(|e| LLMError::GpuError(format!("lm_head f16->f32 alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((hidden_size as u32) + threads - 1) / threads;

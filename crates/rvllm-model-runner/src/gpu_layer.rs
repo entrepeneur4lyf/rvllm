@@ -18,7 +18,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceSlice, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{info, trace};
 
@@ -151,6 +151,71 @@ mod inner {
         /// throughout: rms_norm_f16, add_bias_f16, rotary_embedding_f16,
         /// reshape_and_cache_f16io, flash_attention_2_decode_f16io, hgemm,
         /// fused_residual_rmsnorm_f16, fused_silu_mul_f16, add_f16.
+        // ==================================================================
+        // Allocation audit (per layer, decode path with fused weights):
+        //
+        //  #  Buffer        Size (elems)         Overwritten by     Last read at
+        //  -- ------------- -------------------- ------------------ ------------------
+        //  1  normed        T*H                  rms_norm_f16       step 2 (QKV hgemm)
+        //  2  qkv           T*(Q+2K)             hgemm (fused)      step 5 (KV cache write, attn Q slice)
+        //  3  attn_out      T*Q                  decode_attn_f16io  step 7 (O proj hgemm)
+        //  4  attn_proj     T*H                  hgemm (O proj)     step 8 (fused resid+norm)
+        //  5  normed2       T*H                  fused_resid_rn     step 9 (gate_up hgemm)
+        //  6  residual      T*H                  fused_resid_rn     step 11 (final add)
+        //  7  gate_up       T*2I                 hgemm (gate+up)    step 9 (silu_mul reads both halves)
+        //  8  fused(silu)   T*I                  silu_mul_f16_split step 10 (down proj hgemm)
+        //  9  mlp_out       T*H                  hgemm (down proj)  step 11 (final add)
+        // 10  final_out     T*H                  add_tensors_f16    returned to caller
+        //
+        // Prefill-only extras (instead of #3 above):
+        //  3a q_f32         T*Q  (f32!)          cast_f16_to_f32    prefill_attention input
+        //  3b attn_f32      T*Q  (f32!)          prefill_attention  cast_f32_to_f16 input
+        //  3c attn_out      T*Q                  cast_f32_to_f16    step 7 (O proj hgemm)
+        //  Prefill total: 12 allocs (3 extra for f32 round-trip)
+        //
+        // Unfused fallback extras:
+        //  - separate Q/K/V instead of fused qkv: 3 allocs via hgemm_into (still 1 buf)
+        //  - separate gate + up instead of fused: 2 hgemm_alloc + 1 silu = same count
+        //
+        // Total decode: 10 allocs
+        // Total prefill: 12 allocs
+        //
+        // === Scratch buffer aliasing candidates ===
+        //
+        // Lifetime analysis (decode path, sequential execution on one stream):
+        //
+        //   normed     [1]: live during step 2, dead after QKV hgemm completes
+        //   qkv        [2]: live steps 2-5, dead after KV cache write + attn Q read
+        //   attn_out   [3]: live steps 6-7, dead after O proj hgemm
+        //   attn_proj  [4]: live steps 7-8, dead after fused_resid_rmsnorm
+        //   normed2    [5]: live steps 8-9, dead after gate_up hgemm
+        //   residual   [6]: live steps 8-11, LONG-LIVED (spans entire MLP)
+        //   gate_up    [7]: live step 9, dead after silu_mul
+        //   fused      [8]: live steps 9-10, dead after down proj hgemm
+        //   mlp_out    [9]: live steps 10-11, dead after final add
+        //   final_out [10]: returned, cannot alias
+        //
+        // Reuse opportunities (non-overlapping lifetimes):
+        //   A) normed [T*H] dead at step 2 -> reuse for attn_out [T*Q] at step 6
+        //      (Q = num_heads*head_dim = H for most models, exact same size)
+        //   B) qkv [T*(Q+2K)] dead at step 5 -> reuse for gate_up [T*2I] at step 9
+        //      (qkv_dim ~ H+2*H/GQA_ratio, gate_up = 2*I; for llama 2I > qkv, but
+        //       qkv buf could be a prefix if gate_up scratch is sized to max(qkv,2I))
+        //   C) attn_out [T*Q] dead at step 7 -> reuse for fused/silu [T*I] at step 9
+        //      (I > Q typically, so need max(Q,I) sizing)
+        //   D) attn_proj [T*H] dead at step 8 -> reuse for mlp_out [T*H] at step 10
+        //      (exact same size)
+        //   E) normed2 [T*H] dead at step 9 -> reuse for mlp_out [T*H] at step 10
+        //      (exact same size, alternative to D)
+        //
+        // LOW-HANGING FRUIT (same size, zero waste):
+        //   1. attn_proj -> mlp_out  [both T*H, saves 1 alloc]
+        //   2. normed -> attn_out    [T*H vs T*Q, same when Q=H, saves 1 alloc]
+        //   3. normed2 is an alternative to attn_proj for mlp_out reuse
+        //
+        // With a single scratch buffer sized to max(T*qkv_dim, T*2I, T*H):
+        //   Could eliminate 4-5 allocs, reducing 10 -> 5-6 per layer.
+        // ==================================================================
         pub fn forward_f16(
             &self,
             input: &GpuLayerInput<'_>,
@@ -1372,8 +1437,8 @@ mod inner {
             hidden_size: usize,
         ) -> Result<CudaSlice<f16>> {
             let n = num_tokens * hidden_size;
-            let mut output = stream
-                .alloc_zeros::<f16>(n)
+            // Safety: kernel writes all num_tokens * hidden_size elements
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("rms_norm_f16 alloc: {e}")))?;
             let block_threads = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -1395,6 +1460,39 @@ mod inner {
             Ok(output)
         }
 
+        /// In-place RMSNorm f16: normalizes `input` directly, no output allocation.
+        /// Safe because the kernel uses __syncthreads() between the read pass and
+        /// write pass within each block (single-token-per-block launch).
+        fn rms_norm_f16_inplace(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            input: &mut CudaSlice<f16>,
+            weight: &CudaSlice<f16>,
+            eps: f32,
+            num_tokens: usize,
+            hidden_size: usize,
+        ) -> Result<()> {
+            let block_threads = hidden_size.min(1024) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (block_threads, 1, 1),
+                shared_mem_bytes: block_threads * std::mem::size_of::<f32>() as u32,
+            };
+            let kernel = loader.get_func("rms_norm_f16", "rms_norm_f16_kernel")?;
+            unsafe {
+                let (raw_ptr, _guard) = DevicePtrMut::device_ptr_mut(input, stream);
+                stream.launch_builder(&kernel)
+                    .arg(&raw_ptr)  // output (same ptr)
+                    .arg(&raw_ptr)  // input  (same ptr)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(hidden_size as i32))
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("rms_norm_f16_inplace launch: {e}")))?;
+            }
+            Ok(())
+        }
+
         /// hgemm with output allocation: f16 x f16 -> f16.
         fn hgemm_alloc(
             stream: &Arc<CudaStream>,
@@ -1405,8 +1503,8 @@ mod inner {
             n: usize,
             k: usize,
         ) -> Result<CudaSlice<f16>> {
-            let mut output = stream
-                .alloc_zeros::<f16>(m * n)
+            // Safety: hgemm with beta=0 writes all m*n elements
+            let mut output = unsafe { stream.alloc::<f16>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("hgemm_alloc: {e}")))?;
             blas.hgemm(m, n, k, f16::ONE, input, weight, f16::ZERO, &mut output)?;
             Ok(output)
@@ -1527,8 +1625,8 @@ mod inner {
             block_size: usize,
         ) -> Result<CudaSlice<f16>> {
             let out_len = num_tokens * num_heads * head_dim;
-            let mut output = stream
-                .alloc_zeros::<f16>(out_len)
+            // Safety: attention kernel writes all out_len elements
+            let mut output = unsafe { stream.alloc::<f16>(out_len) }
                 .map_err(|e| LLMError::GpuError(format!("decode_attn_f16io alloc: {e}")))?;
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1588,9 +1686,10 @@ mod inner {
             hidden_size: usize,
         ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
             let n = num_tokens * hidden_size;
-            let mut output = stream.alloc_zeros::<f16>(n)
+            // Safety: kernel writes all n elements to both output and residual
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("fused_rn_f16 output alloc: {e}")))?;
-            let mut residual = stream.alloc_zeros::<f16>(n)
+            let mut residual = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("fused_rn_f16 residual alloc: {e}")))?;
             let block_threads = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -1622,7 +1721,8 @@ mod inner {
             up: &CudaSlice<f16>,
             n: usize,
         ) -> Result<CudaSlice<f16>> {
-            let mut output = stream.alloc_zeros::<f16>(n)
+            // Safety: element-wise kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("fused_silu_mul_f16 alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((n as u32) + threads - 1) / threads;
@@ -1652,7 +1752,8 @@ mod inner {
         ) -> Result<CudaSlice<f16>> {
             let gate_view = gate_up.slice(..n);
             let up_view = gate_up.slice(n..n * 2);
-            let mut output = stream.alloc_zeros::<f16>(n)
+            // Safety: element-wise kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("fused_silu_mul_f16_split alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((n as u32) + threads - 1) / threads;
@@ -1681,7 +1782,8 @@ mod inner {
             b: &CudaSlice<f16>,
             n: usize,
         ) -> Result<CudaSlice<f16>> {
-            let mut output = stream.alloc_zeros::<f16>(n)
+            // Safety: element-wise kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("add_tensors_f16 alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((n as u32) + threads - 1) / threads;
@@ -1709,7 +1811,8 @@ mod inner {
             n: usize,
             kernel: &CudaFunction,
         ) -> Result<CudaSlice<f32>> {
-            let mut output = stream.alloc_zeros::<f32>(n)
+            // Safety: cast kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f32>(n) }
                 .map_err(|e| LLMError::GpuError(format!("cast_f16_f32 alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((n as u32) + threads - 1) / threads;
@@ -1736,7 +1839,8 @@ mod inner {
             n: usize,
             kernel: &CudaFunction,
         ) -> Result<CudaSlice<f16>> {
-            let mut output = stream.alloc_zeros::<f16>(n)
+            // Safety: cast kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f16>(n) }
                 .map_err(|e| LLMError::GpuError(format!("cast_f32_f16 alloc: {e}")))?;
             let threads = 256u32;
             let blocks = ((n as u32) + threads - 1) / threads;
